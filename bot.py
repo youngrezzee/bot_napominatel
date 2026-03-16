@@ -8,11 +8,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -41,7 +42,20 @@ class Event:
     created_by_user_id: int
     created_by_name: str
     title: str
+    mention_usernames: str
     event_at_utc: datetime
+
+
+@dataclass(slots=True)
+class PendingEvent:
+    chat_id: int
+    message_thread_id: int | None
+    created_by_user_id: int
+    created_by_name: str
+    title: str
+    local_dt: datetime
+    source_message_id: int | None
+    selected_usernames: set[str]
 
 
 class EventStorage:
@@ -65,8 +79,21 @@ class EventStorage:
                     created_by_user_id INTEGER NOT NULL,
                     created_by_name TEXT NOT NULL,
                     title TEXT NOT NULL,
+                    mention_usernames TEXT NOT NULL DEFAULT '',
                     event_at_utc TEXT NOT NULL,
                     created_at_utc TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_users (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL,
+                    last_seen_at_utc TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, user_id)
                 )
                 """
             )
@@ -78,6 +105,48 @@ class EventStorage:
                 connection.execute(
                     "ALTER TABLE events ADD COLUMN message_thread_id INTEGER"
                 )
+            if "mention_usernames" not in columns:
+                connection.execute(
+                    "ALTER TABLE events ADD COLUMN mention_usernames TEXT NOT NULL DEFAULT ''"
+                )
+
+    def upsert_chat_user(
+        self,
+        chat_id: int,
+        user_id: int,
+        username: str | None,
+        display_name: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO chat_users (chat_id, user_id, username, display_name, last_seen_at_utc)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    username = excluded.username,
+                    display_name = excluded.display_name,
+                    last_seen_at_utc = excluded.last_seen_at_utc
+                """,
+                (
+                    chat_id,
+                    user_id,
+                    username or "",
+                    display_name,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+    def get_known_chat_users(self, chat_id: int) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT user_id, username, display_name
+                FROM chat_users
+                WHERE chat_id = ? AND username != ''
+                ORDER BY last_seen_at_utc DESC, display_name ASC
+                """,
+                (chat_id,),
+            ).fetchall()
 
     def add_event(
         self,
@@ -86,6 +155,7 @@ class EventStorage:
         created_by_user_id: int,
         created_by_name: str,
         title: str,
+        mention_usernames: str,
         event_at_utc: datetime,
     ) -> Event:
         event_iso = event_at_utc.astimezone(timezone.utc).isoformat()
@@ -99,9 +169,10 @@ class EventStorage:
                     created_by_user_id,
                     created_by_name,
                     title,
+                    mention_usernames,
                     event_at_utc,
                     created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chat_id,
@@ -109,6 +180,7 @@ class EventStorage:
                     created_by_user_id,
                     created_by_name,
                     title,
+                    mention_usernames,
                     event_iso,
                     created_iso,
                 ),
@@ -122,6 +194,7 @@ class EventStorage:
             created_by_user_id=created_by_user_id,
             created_by_name=created_by_name,
             title=title,
+            mention_usernames=mention_usernames,
             event_at_utc=datetime.fromisoformat(event_iso),
         )
 
@@ -130,7 +203,7 @@ class EventStorage:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, event_at_utc
+                SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, mention_usernames, event_at_utc
                 FROM events
                 WHERE event_at_utc > ?
                 ORDER BY event_at_utc ASC
@@ -147,7 +220,7 @@ class EventStorage:
             if message_thread_id is None:
                 rows = connection.execute(
                     """
-                    SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, event_at_utc
+                    SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, mention_usernames, event_at_utc
                     FROM events
                     WHERE chat_id = ? AND message_thread_id IS NULL AND event_at_utc > ?
                     ORDER BY event_at_utc ASC
@@ -157,7 +230,7 @@ class EventStorage:
             else:
                 rows = connection.execute(
                     """
-                    SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, event_at_utc
+                    SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, mention_usernames, event_at_utc
                     FROM events
                     WHERE chat_id = ? AND message_thread_id = ? AND event_at_utc > ?
                     ORDER BY event_at_utc ASC
@@ -207,6 +280,7 @@ class EventStorage:
             created_by_user_id=row["created_by_user_id"],
             created_by_name=row["created_by_name"],
             title=row["title"],
+            mention_usernames=row["mention_usernames"],
             event_at_utc=datetime.fromisoformat(row["event_at_utc"]),
         )
 
@@ -216,6 +290,7 @@ class ReminderBot:
         self.local_tz = ZoneInfo(local_tz_name)
         self.storage = EventStorage(db_path)
         self.application: Application = ApplicationBuilder().token(token).build()
+        self.pending_events: dict[str, PendingEvent] = {}
         self._register_handlers()
 
     def _register_handlers(self) -> None:
@@ -225,6 +300,9 @@ class ReminderBot:
         self.application.add_handler(CommandHandler("delete", self.delete_event))
         self.application.add_handler(CommandHandler("delete_all", self.delete_all_events))
         self.application.add_handler(CommandHandler("ping", self.ping))
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_callback_query, pattern=r"^mentions:")
+        )
         self.application.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message)
         )
@@ -276,6 +354,8 @@ class ReminderBot:
         for event in events[:20]:
             local_dt = event.event_at_utc.astimezone(self.local_tz)
             lines.append(f"#{event.id} • {local_dt.strftime('%d.%m.%Y %H:%M')} • {event.title}")
+            if event.mention_usernames:
+                lines.append(f"  - теги: {event.mention_usernames}")
             for label, delta in REMINDER_OFFSETS:
                 remind_at = local_dt - delta
                 if remind_at <= now_local:
@@ -360,6 +440,13 @@ class ReminderBot:
         if not message or not message.text or not chat or not user:
             return
 
+        self.storage.upsert_chat_user(
+            chat_id=chat.id,
+            user_id=user.id,
+            username=user.username,
+            display_name=user.full_name,
+        )
+
         logging.info(
             "Incoming text | chat_id=%s | user_id=%s | text=%r",
             chat.id,
@@ -378,7 +465,7 @@ class ReminderBot:
             )
             return
 
-        local_dt, title = parsed
+        local_dt, title, mention_usernames = parsed
         now_local = datetime.now(self.local_tz)
         if local_dt <= now_local:
             await self._reply(
@@ -388,35 +475,41 @@ class ReminderBot:
             )
             return
 
-        event = self.storage.add_event(
+        if chat.type == "private":
+            await self._create_event_and_confirm(
+                update=update,
+                local_dt=local_dt,
+                title=title,
+                mention_usernames=mention_usernames,
+            )
+            return
+
+        draft_id = f"{chat.id}_{message.message_id}"
+        pending_event = PendingEvent(
             chat_id=chat.id,
             message_thread_id=message.message_thread_id,
             created_by_user_id=user.id,
             created_by_name=user.full_name,
             title=title,
-            event_at_utc=local_dt.astimezone(timezone.utc),
+            local_dt=local_dt,
+            source_message_id=message.message_id,
+            selected_usernames=set(mention_usernames.split()) if mention_usernames else set(),
         )
-        self.schedule_event_reminders(event)
+        self.pending_events[draft_id] = pending_event
 
-        reminders = []
-        for label, delta in REMINDER_OFFSETS:
-            if local_dt - delta > now_local:
-                reminders.append(label)
-            elif delta == timedelta():
-                reminders.append(label)
-
-        reminder_text = ", ".join(reminders) if reminders else "нет доступных напоминаний"
-        await self._reply(
-            update,
-            "Событие сохранено, напоминания установлены.\n"
-            f"ID: #{event.id}\n"
-            f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')} ({self.local_tz.key})\n"
-            f"Что: {title}\n"
-            f"Напоминания: {reminder_text}",
-            cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
+        keyboard = await self._build_mentions_keyboard(chat.id, draft_id)
+        prompt_text = (
+            "Для кого задача?\n"
+            "Выбери пользователей, которых нужно тегать в напоминании.\n"
+            "Сначала показываю админов чата. Если их не удалось получить, покажу известных пользователей с @username."
+        )
+        await chat.send_message(
+            prompt_text,
+            message_thread_id=message.message_thread_id,
+            reply_markup=keyboard,
         )
 
-    def _parse_event_message(self, text: str) -> tuple[datetime, str] | None:
+    def _parse_event_message(self, text: str) -> tuple[datetime, str, str] | None:
         match = DATE_INPUT_RE.match(text)
         if not match:
             return None
@@ -429,7 +522,22 @@ class ReminderBot:
             )
         except ValueError:
             return None
-        return naive_dt.replace(tzinfo=self.local_tz), title.strip()
+
+        title_text, mention_usernames = self._split_title_and_mentions(title.strip())
+        if not title_text:
+            return None
+
+        return naive_dt.replace(tzinfo=self.local_tz), title_text, mention_usernames
+
+    @staticmethod
+    def _split_title_and_mentions(title: str) -> tuple[str, str]:
+        if "|" not in title:
+            return title, ""
+
+        title_text, mentions_part = title.split("|", 1)
+        usernames = re.findall(r"@\w{3,}", mentions_part)
+        unique_usernames = " ".join(dict.fromkeys(usernames))
+        return title_text.strip(), unique_usernames
 
     def schedule_event_reminders(self, event: Event) -> None:
         for label, delta in REMINDER_OFFSETS:
@@ -447,30 +555,223 @@ class ReminderBot:
                     "chat_id": event.chat_id,
                     "message_thread_id": event.message_thread_id,
                     "title": event.title,
+                    "mention_usernames": event.mention_usernames,
                     "event_at_utc": event.event_at_utc.isoformat(),
                     "created_by_name": event.created_by_name,
                     "offset_label": label,
                 },
             )
 
+    async def handle_callback_query(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        query = update.callback_query
+        if not query or not query.data or not query.from_user:
+            return
+
+        await query.answer()
+        parts = query.data.split(":")
+        if len(parts) < 3:
+            return
+
+        _, action, draft_id = parts[0], parts[1], parts[2]
+        pending_event = self.pending_events.get(draft_id)
+        if not pending_event:
+            await query.edit_message_text("Черновик события уже истек. Отправь событие заново.")
+            return
+
+        if pending_event.created_by_user_id != query.from_user.id:
+            await query.answer("Выбирать теги может только автор события.", show_alert=True)
+            return
+
+        if action == "toggle" and len(parts) == 4:
+            username = parts[3]
+            if username in pending_event.selected_usernames:
+                pending_event.selected_usernames.remove(username)
+            else:
+                pending_event.selected_usernames.add(username)
+            keyboard = await self._build_mentions_keyboard(
+                pending_event.chat_id,
+                draft_id,
+                pending_event.selected_usernames,
+            )
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+            return
+
+        if action == "skip":
+            pending_event.selected_usernames.clear()
+            await self._finalize_pending_event(update, draft_id, query)
+            return
+
+        if action == "done":
+            await self._finalize_pending_event(update, draft_id, query)
+
+    async def _finalize_pending_event(
+        self,
+        update: Update,
+        draft_id: str,
+        query,
+    ) -> None:
+        pending_event = self.pending_events.pop(draft_id, None)
+        if not pending_event:
+            await query.edit_message_text("Черновик события уже истек. Отправь событие заново.")
+            return
+
+        mention_usernames = " ".join(sorted(pending_event.selected_usernames))
+        await query.edit_message_text(
+            "Список тегов сохранен."
+            if mention_usernames
+            else "Событие будет без тегов."
+        )
+
+        await self._create_event_and_confirm(
+            update=update,
+            local_dt=pending_event.local_dt,
+            title=pending_event.title,
+            mention_usernames=mention_usernames,
+            created_by_user_id=pending_event.created_by_user_id,
+            created_by_name=pending_event.created_by_name,
+            chat_id=pending_event.chat_id,
+            message_thread_id=pending_event.message_thread_id,
+        )
+        if pending_event.source_message_id:
+            self._schedule_message_cleanup(
+                chat_id=pending_event.chat_id,
+                bot_message_id=pending_event.source_message_id,
+                user_message_id=None,
+                delay_seconds=CLEANUP_DELAY_SECONDS,
+            )
+
+    async def _build_mentions_keyboard(
+        self,
+        chat_id: int,
+        draft_id: str,
+        selected_usernames: set[str] | None = None,
+    ) -> InlineKeyboardMarkup:
+        selected_usernames = selected_usernames or set()
+        candidates = await self._get_mention_candidates(chat_id)
+
+        rows: list[list[InlineKeyboardButton]] = []
+        for username in candidates[:12]:
+            prefix = "✅ " if username in selected_usernames else ""
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{prefix}{username}",
+                        callback_data=f"mentions:toggle:{draft_id}:{username}",
+                    )
+                ]
+            )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Без тегов",
+                    callback_data=f"mentions:skip:{draft_id}",
+                ),
+                InlineKeyboardButton(
+                    text="Готово",
+                    callback_data=f"mentions:done:{draft_id}",
+                ),
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
+
+    async def _get_mention_candidates(self, chat_id: int) -> list[str]:
+        try:
+            admins = await self.application.bot.get_chat_administrators(chat_id)
+            admin_usernames = []
+            for admin in admins:
+                if admin.user.username:
+                    admin_usernames.append(f"@{admin.user.username}")
+            admin_usernames = sorted(dict.fromkeys(admin_usernames), key=str.lower)
+            if admin_usernames:
+                return admin_usernames
+        except Exception:
+            logging.debug("Failed to fetch chat administrators for %s", chat_id)
+
+        usernames = {
+            row["username"]
+            for row in self.storage.get_known_chat_users(chat_id)
+            if row["username"]
+        }
+        normalized = []
+        for username in usernames:
+            normalized.append(username if username.startswith("@") else f"@{username}")
+        return sorted(dict.fromkeys(normalized), key=str.lower)
+
+    async def _create_event_and_confirm(
+        self,
+        update: Update,
+        local_dt: datetime,
+        title: str,
+        mention_usernames: str,
+        created_by_user_id: int | None = None,
+        created_by_name: str | None = None,
+        chat_id: int | None = None,
+        message_thread_id: int | None = None,
+    ) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.effective_message
+        if not chat or not user:
+            return
+
+        event = self.storage.add_event(
+            chat_id=chat_id if chat_id is not None else chat.id,
+            message_thread_id=message_thread_id if message_thread_id is not None else (message.message_thread_id if message else None),
+            created_by_user_id=created_by_user_id if created_by_user_id is not None else user.id,
+            created_by_name=created_by_name if created_by_name is not None else user.full_name,
+            title=title,
+            mention_usernames=mention_usernames,
+            event_at_utc=local_dt.astimezone(timezone.utc),
+        )
+        self.schedule_event_reminders(event)
+
+        now_local = datetime.now(self.local_tz)
+        reminders = []
+        for label, delta in REMINDER_OFFSETS:
+            if local_dt - delta > now_local:
+                reminders.append(label)
+            elif delta == timedelta():
+                reminders.append(label)
+
+        reminder_text = ", ".join(reminders) if reminders else "нет доступных напоминаний"
+        await self._reply(
+            update,
+            "Событие сохранено, напоминания установлены.\n"
+            f"ID: #{event.id}\n"
+            f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')} ({self.local_tz.key})\n"
+            f"Что: {title}\n"
+            f"Кого тегать: {mention_usernames or 'никого'}\n"
+            f"Напоминания: {reminder_text}",
+            cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
+        )
+
     async def send_reminder(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         job_data = context.job.data
         event_at = datetime.fromisoformat(job_data["event_at_utc"]).astimezone(self.local_tz)
+        reminder_text = (
+            (
+                f"{job_data['mention_usernames']}\n"
+                if job_data["mention_usernames"]
+                else ""
+            )
+            + (
+                f"Событие начинается сейчас\n"
+                if job_data["offset_label"] == "момент события"
+                else f"Напоминание: через {job_data['offset_label']} событие\n"
+            )
+            + (
+                f"«{job_data['title']}»\n"
+                f"Когда: {event_at.strftime('%d.%m.%Y %H:%M')} ({self.local_tz.key})\n"
+                f"Создал: {job_data['created_by_name']}"
+            )
+        )
         await context.bot.send_message(
             chat_id=job_data["chat_id"],
             message_thread_id=job_data["message_thread_id"],
-            text=(
-                (
-                    f"Событие начинается сейчас\n"
-                    if job_data["offset_label"] == "момент события"
-                    else f"Напоминание: через {job_data['offset_label']} событие\n"
-                )
-                + (
-                    f"«{job_data['title']}»\n"
-                    f"Когда: {event_at.strftime('%d.%m.%Y %H:%M')} ({self.local_tz.key})\n"
-                    f"Создал: {job_data['created_by_name']}"
-                )
-            ),
+            text=reminder_text,
         )
 
     async def handle_error(
@@ -565,7 +866,8 @@ class ReminderBot:
         return (
             "Я сохраняю события и напоминаю о них за <b>1 день</b>, <b>3 часа</b> и <b>1 час</b>.\n\n"
             "Формат сообщения:\n"
-            "<code>16.03.2026 18:30 Встреча с командой</code>\n\n"
+            "<code>16.03.2026 18:30 Встреча с командой</code>\n"
+            "<code>16.03.2026 18:30 Встреча с командой | @nikita @anna</code>\n\n"
             "Команды:\n"
             "/list - показать события и все будущие напоминания\n"
             "/delete ID - удалить событие\n"

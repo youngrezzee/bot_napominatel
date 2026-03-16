@@ -32,6 +32,8 @@ REMINDER_OFFSETS = (
 )
 CLEANUP_DELAY_SECONDS = 60
 LIST_CLEANUP_DELAY_SECONDS = 120
+DAY_REMINDER_DELETE_DELAY = timedelta(hours=8)
+MONTHLY_REMINDER_CLEANUP_INTERVAL = timedelta(days=30)
 
 
 @dataclass(slots=True)
@@ -56,6 +58,18 @@ class PendingEvent:
     local_dt: datetime
     source_message_id: int | None
     selected_usernames: set[str]
+
+
+@dataclass(slots=True)
+class ReminderMessage:
+    id: int
+    event_id: int
+    chat_id: int
+    message_id: int
+    offset_label: str
+    event_at_utc: datetime
+    delete_at_utc: datetime | None
+    deleted_at_utc: datetime | None
 
 
 class EventStorage:
@@ -94,6 +108,21 @@ class EventStorage:
                     display_name TEXT NOT NULL,
                     last_seen_at_utc TEXT NOT NULL,
                     PRIMARY KEY (chat_id, user_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reminder_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    offset_label TEXT NOT NULL,
+                    event_at_utc TEXT NOT NULL,
+                    delete_at_utc TEXT,
+                    deleted_at_utc TEXT,
+                    created_at_utc TEXT NOT NULL
                 )
                 """
             )
@@ -147,6 +176,91 @@ class EventStorage:
                 """,
                 (chat_id,),
             ).fetchall()
+
+    def add_reminder_message(
+        self,
+        event_id: int,
+        chat_id: int,
+        message_id: int,
+        offset_label: str,
+        event_at_utc: datetime,
+        delete_at_utc: datetime | None,
+    ) -> ReminderMessage:
+        delete_iso = delete_at_utc.isoformat() if delete_at_utc else None
+        created_iso = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO reminder_messages (
+                    event_id,
+                    chat_id,
+                    message_id,
+                    offset_label,
+                    event_at_utc,
+                    delete_at_utc,
+                    deleted_at_utc,
+                    created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    event_id,
+                    chat_id,
+                    message_id,
+                    offset_label,
+                    event_at_utc.isoformat(),
+                    delete_iso,
+                    created_iso,
+                ),
+            )
+            reminder_id = cursor.lastrowid
+
+        return ReminderMessage(
+            id=reminder_id,
+            event_id=event_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            offset_label=offset_label,
+            event_at_utc=event_at_utc,
+            delete_at_utc=delete_at_utc,
+            deleted_at_utc=None,
+        )
+
+    def get_pending_reminder_cleanups(self) -> list[ReminderMessage]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, event_id, chat_id, message_id, offset_label, event_at_utc, delete_at_utc, deleted_at_utc
+                FROM reminder_messages
+                WHERE deleted_at_utc IS NULL AND delete_at_utc IS NOT NULL
+                ORDER BY delete_at_utc ASC
+                """
+            ).fetchall()
+        return [self._row_to_reminder_message(row) for row in rows]
+
+    def get_monthly_cleanup_candidates(self) -> list[ReminderMessage]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, event_id, chat_id, message_id, offset_label, event_at_utc, delete_at_utc, deleted_at_utc
+                FROM reminder_messages
+                WHERE deleted_at_utc IS NULL AND event_at_utc < ?
+                ORDER BY event_at_utc ASC
+                """,
+                (now_iso,),
+            ).fetchall()
+        return [self._row_to_reminder_message(row) for row in rows]
+
+    def mark_reminder_message_deleted(self, reminder_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE reminder_messages
+                SET deleted_at_utc = ?
+                WHERE id = ?
+                """,
+                (datetime.now(timezone.utc).isoformat(), reminder_id),
+            )
 
     def add_event(
         self,
@@ -284,6 +398,27 @@ class EventStorage:
             event_at_utc=datetime.fromisoformat(row["event_at_utc"]),
         )
 
+    @staticmethod
+    def _row_to_reminder_message(row: sqlite3.Row) -> ReminderMessage:
+        return ReminderMessage(
+            id=row["id"],
+            event_id=row["event_id"],
+            chat_id=row["chat_id"],
+            message_id=row["message_id"],
+            offset_label=row["offset_label"],
+            event_at_utc=datetime.fromisoformat(row["event_at_utc"]),
+            delete_at_utc=(
+                datetime.fromisoformat(row["delete_at_utc"])
+                if row["delete_at_utc"]
+                else None
+            ),
+            deleted_at_utc=(
+                datetime.fromisoformat(row["deleted_at_utc"])
+                if row["deleted_at_utc"]
+                else None
+            ),
+        )
+
 
 class ReminderBot:
     def __init__(self, token: str, db_path: Path, local_tz_name: str) -> None:
@@ -312,6 +447,14 @@ class ReminderBot:
     async def on_startup(self, application: Application) -> None:
         for event in self.storage.get_upcoming_events():
             self.schedule_event_reminders(event)
+        for reminder_message in self.storage.get_pending_reminder_cleanups():
+            self.schedule_reminder_message_cleanup(reminder_message)
+        self.application.job_queue.run_repeating(
+            self.run_monthly_reminder_cleanup,
+            interval=MONTHLY_REMINDER_CLEANUP_INTERVAL,
+            first=MONTHLY_REMINDER_CLEANUP_INTERVAL,
+            name="monthly_reminder_cleanup",
+        )
         logging.info("Loaded %s upcoming events", len(self.storage.get_upcoming_events()))
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -750,7 +893,8 @@ class ReminderBot:
 
     async def send_reminder(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         job_data = context.job.data
-        event_at = datetime.fromisoformat(job_data["event_at_utc"]).astimezone(self.local_tz)
+        event_at_utc = datetime.fromisoformat(job_data["event_at_utc"])
+        event_at = event_at_utc.astimezone(self.local_tz)
         reminder_text = (
             (
                 f"{job_data['mention_usernames']}\n"
@@ -768,16 +912,96 @@ class ReminderBot:
                 f"Создал: {job_data['created_by_name']}"
             )
         )
-        await context.bot.send_message(
+        sent_message = await context.bot.send_message(
             chat_id=job_data["chat_id"],
             message_thread_id=job_data["message_thread_id"],
             text=reminder_text,
         )
+        delete_at_utc = self._get_reminder_delete_time(
+            offset_label=job_data["offset_label"],
+            event_at_utc=event_at_utc,
+        )
+        reminder_message = self.storage.add_reminder_message(
+            event_id=job_data["event_id"],
+            chat_id=job_data["chat_id"],
+            message_id=sent_message.message_id,
+            offset_label=job_data["offset_label"],
+            event_at_utc=event_at_utc,
+            delete_at_utc=delete_at_utc,
+        )
+        if reminder_message.delete_at_utc is not None:
+            self.schedule_reminder_message_cleanup(reminder_message)
 
     async def handle_error(
         self, update: object, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         logging.exception("Unhandled error while processing update", exc_info=context.error)
+
+    def _get_reminder_delete_time(
+        self, offset_label: str, event_at_utc: datetime
+    ) -> datetime | None:
+        now_utc = datetime.now(timezone.utc)
+        if offset_label == "1 день":
+            return now_utc + DAY_REMINDER_DELETE_DELAY
+        if offset_label in {"3 часа", "1 час"}:
+            return event_at_utc
+        return None
+
+    def schedule_reminder_message_cleanup(self, reminder_message: ReminderMessage) -> None:
+        if reminder_message.delete_at_utc is None:
+            return
+
+        when = reminder_message.delete_at_utc
+        if when <= datetime.now(timezone.utc):
+            when = 0
+
+        self.application.job_queue.run_once(
+            self.delete_reminder_message,
+            when=when,
+            name=f"reminder_cleanup:{reminder_message.id}",
+            data={
+                "reminder_id": reminder_message.id,
+                "chat_id": reminder_message.chat_id,
+                "message_id": reminder_message.message_id,
+            },
+        )
+
+    async def delete_reminder_message(
+        self, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        job_data = context.job.data
+        try:
+            await context.bot.delete_message(
+                chat_id=job_data["chat_id"],
+                message_id=job_data["message_id"],
+            )
+        except Exception:
+            logging.debug(
+                "Failed to delete reminder message %s in chat %s",
+                job_data["message_id"],
+                job_data["chat_id"],
+            )
+        finally:
+            self.storage.mark_reminder_message_deleted(job_data["reminder_id"])
+
+    async def run_monthly_reminder_cleanup(
+        self, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        cleanup_candidates = self.storage.get_monthly_cleanup_candidates()
+        for reminder_message in cleanup_candidates:
+            try:
+                await context.bot.delete_message(
+                    chat_id=reminder_message.chat_id,
+                    message_id=reminder_message.message_id,
+                )
+            except Exception:
+                logging.debug(
+                    "Failed monthly cleanup for reminder message %s in chat %s",
+                    reminder_message.message_id,
+                    reminder_message.chat_id,
+                )
+            finally:
+                self.storage.mark_reminder_message_deleted(reminder_message.id)
 
     async def _reply(
         self,

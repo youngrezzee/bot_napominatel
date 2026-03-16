@@ -29,6 +29,8 @@ REMINDER_OFFSETS = (
     ("1 час", timedelta(hours=1)),
     ("момент события", timedelta()),
 )
+CLEANUP_DELAY_SECONDS = 60
+LIST_CLEANUP_DELAY_SECONDS = 120
 
 
 @dataclass(slots=True)
@@ -239,6 +241,7 @@ class ReminderBot:
             update,
             self._help_text(),
             parse_mode=ParseMode.HTML,
+            cleanup_delay_seconds=LIST_CLEANUP_DELAY_SECONDS,
         )
 
     async def help_command(
@@ -248,10 +251,11 @@ class ReminderBot:
             update,
             self._help_text(),
             parse_mode=ParseMode.HTML,
+            cleanup_delay_seconds=LIST_CLEANUP_DELAY_SECONDS,
         )
 
     async def ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._reply(update, "pong")
+        await self._reply(update, "pong", cleanup_delay_seconds=CLEANUP_DELAY_SECONDS)
 
     async def list_events(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -260,7 +264,11 @@ class ReminderBot:
         thread_id = update.effective_message.message_thread_id if update.effective_message else None
         events = self.storage.get_upcoming_events_for_chat(chat.id, thread_id)
         if not events:
-            await self._reply(update, "Активных событий пока нет.")
+            await self._reply(
+                update,
+                "Активных событий пока нет.",
+                cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
+            )
             return
 
         now_local = datetime.now(self.local_tz)
@@ -276,30 +284,50 @@ class ReminderBot:
                     lines.append(f"  - в момент события: {local_dt.strftime('%d.%m.%Y %H:%M')}")
                 else:
                     lines.append(f"  - за {label}: {remind_at.strftime('%d.%m.%Y %H:%M')}")
-        await self._reply(update, "\n".join(lines))
+        await self._reply(
+            update,
+            "\n".join(lines),
+            cleanup_delay_seconds=LIST_CLEANUP_DELAY_SECONDS,
+        )
 
     async def delete_event(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         chat = update.effective_chat
         if not context.args:
-            await self._reply(update, "Использование: /delete <id>")
+            await self._reply(
+                update,
+                "Использование: /delete <id>",
+                cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
+            )
             return
 
         try:
             event_id = int(context.args[0])
         except ValueError:
-            await self._reply(update, "ID должен быть числом. Пример: /delete 3")
+            await self._reply(
+                update,
+                "ID должен быть числом. Пример: /delete 3",
+                cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
+            )
             return
 
         thread_id = update.effective_message.message_thread_id if update.effective_message else None
         deleted = self.storage.delete_event(event_id, chat.id, thread_id)
         if not deleted:
-            await self._reply(update, "Событие не найдено.")
+            await self._reply(
+                update,
+                "Событие не найдено.",
+                cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
+            )
             return
 
         self._remove_jobs_for_event(event_id)
-        await self._reply(update, f"Событие #{event_id} удалено.")
+        await self._reply(
+            update,
+            f"Событие #{event_id} удалено.",
+            cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
+        )
 
     async def delete_all_events(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -310,12 +338,17 @@ class ReminderBot:
         self._remove_jobs_for_chat(chat.id, thread_id)
 
         if deleted_count == 0:
-            await self._reply(update, "Активных событий для удаления нет.")
+            await self._reply(
+                update,
+                "Активных событий для удаления нет.",
+                cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
+            )
             return
 
         await self._reply(
             update,
-            f"Удалены все события и напоминания в этом чате: {deleted_count} шт."
+            f"Удалены все события и напоминания в этом чате: {deleted_count} шт.",
+            cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
         )
 
     async def handle_text_message(
@@ -341,13 +374,18 @@ class ReminderBot:
                 "Не понял формат. Отправь сообщение так:\n"
                 "<code>16.03.2026 18:30 Встреча с командой</code>",
                 parse_mode=ParseMode.HTML,
+                cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
             )
             return
 
         local_dt, title = parsed
         now_local = datetime.now(self.local_tz)
         if local_dt <= now_local:
-            await self._reply(update, "Дата события уже в прошлом. Укажи будущее время.")
+            await self._reply(
+                update,
+                "Дата события уже в прошлом. Укажи будущее время.",
+                cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
+            )
             return
 
         event = self.storage.add_event(
@@ -374,7 +412,8 @@ class ReminderBot:
             f"ID: #{event.id}\n"
             f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')} ({self.local_tz.key})\n"
             f"Что: {title}\n"
-            f"Напоминания: {reminder_text}"
+            f"Напоминания: {reminder_text}",
+            cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
         )
 
     def _parse_event_message(self, text: str) -> tuple[datetime, str] | None:
@@ -439,7 +478,13 @@ class ReminderBot:
     ) -> None:
         logging.exception("Unhandled error while processing update", exc_info=context.error)
 
-    async def _reply(self, update: Update, text: str, **kwargs: object) -> None:
+    async def _reply(
+        self,
+        update: Update,
+        text: str,
+        cleanup_delay_seconds: int | None = None,
+        **kwargs: object,
+    ) -> None:
         chat = update.effective_chat
         message = update.effective_message
         if not chat:
@@ -448,7 +493,52 @@ class ReminderBot:
         if message and message.message_thread_id is not None:
             kwargs["message_thread_id"] = message.message_thread_id
 
-        await chat.send_message(text, **kwargs)
+        sent_message = await chat.send_message(text, **kwargs)
+
+        if cleanup_delay_seconds and chat.type != "private":
+            self._schedule_message_cleanup(
+                chat_id=chat.id,
+                bot_message_id=sent_message.message_id,
+                user_message_id=message.message_id if message else None,
+                delay_seconds=cleanup_delay_seconds,
+            )
+
+    def _schedule_message_cleanup(
+        self,
+        chat_id: int,
+        bot_message_id: int,
+        user_message_id: int | None,
+        delay_seconds: int,
+    ) -> None:
+        self.application.job_queue.run_once(
+            self.delete_messages,
+            when=delay_seconds,
+            data={
+                "chat_id": chat_id,
+                "bot_message_id": bot_message_id,
+                "user_message_id": user_message_id,
+            },
+        )
+
+    async def delete_messages(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        job_data = context.job.data
+        for message_id in (
+            job_data.get("user_message_id"),
+            job_data.get("bot_message_id"),
+        ):
+            if not message_id:
+                continue
+            try:
+                await context.bot.delete_message(
+                    chat_id=job_data["chat_id"],
+                    message_id=message_id,
+                )
+            except Exception:
+                logging.debug(
+                    "Failed to delete message %s in chat %s",
+                    message_id,
+                    job_data["chat_id"],
+                )
 
     def _remove_jobs_for_event(self, event_id: int) -> None:
         for job in self.application.job_queue.jobs():

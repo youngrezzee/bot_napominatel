@@ -169,9 +169,11 @@ class ReminderBot:
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("list", self.list_events))
         self.application.add_handler(CommandHandler("delete", self.delete_event))
+        self.application.add_handler(CommandHandler("ping", self.ping))
         self.application.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message)
         )
+        self.application.add_error_handler(self.handle_error)
         self.application.post_init = self.on_startup
 
     async def on_startup(self, application: Application) -> None:
@@ -192,6 +194,9 @@ class ReminderBot:
             self._help_text(),
             parse_mode=ParseMode.HTML,
         )
+
+    async def ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.effective_chat.send_message("pong")
 
     async def list_events(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -240,6 +245,13 @@ class ReminderBot:
         user = update.effective_user
         if not message or not message.text or not chat or not user:
             return
+
+        logging.info(
+            "Incoming text | chat_id=%s | user_id=%s | text=%r",
+            chat.id,
+            user.id,
+            message.text,
+        )
 
         parsed = self._parse_event_message(message.text)
         if not parsed:
@@ -335,6 +347,11 @@ class ReminderBot:
                 )
             ),
         )
+
+    async def handle_error(
+        self, update: object, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        logging.exception("Unhandled error while processing update", exc_info=context.error)
 
     def _remove_jobs_for_event(self, event_id: int) -> None:
         for job in self.application.job_queue.jobs():

@@ -35,6 +35,7 @@ REMINDER_OFFSETS = (
 class Event:
     id: int
     chat_id: int
+    message_thread_id: int | None
     created_by_user_id: int
     created_by_name: str
     title: str
@@ -58,6 +59,7 @@ class EventStorage:
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER NOT NULL,
+                    message_thread_id INTEGER,
                     created_by_user_id INTEGER NOT NULL,
                     created_by_name TEXT NOT NULL,
                     title TEXT NOT NULL,
@@ -66,10 +68,19 @@ class EventStorage:
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(events)").fetchall()
+            }
+            if "message_thread_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE events ADD COLUMN message_thread_id INTEGER"
+                )
 
     def add_event(
         self,
         chat_id: int,
+        message_thread_id: int | None,
         created_by_user_id: int,
         created_by_name: str,
         title: str,
@@ -82,15 +93,17 @@ class EventStorage:
                 """
                 INSERT INTO events (
                     chat_id,
+                    message_thread_id,
                     created_by_user_id,
                     created_by_name,
                     title,
                     event_at_utc,
                     created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chat_id,
+                    message_thread_id,
                     created_by_user_id,
                     created_by_name,
                     title,
@@ -103,6 +116,7 @@ class EventStorage:
         return Event(
             id=event_id,
             chat_id=chat_id,
+            message_thread_id=message_thread_id,
             created_by_user_id=created_by_user_id,
             created_by_name=created_by_name,
             title=title,
@@ -114,7 +128,7 @@ class EventStorage:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, chat_id, created_by_user_id, created_by_name, title, event_at_utc
+                SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, event_at_utc
                 FROM events
                 WHERE event_at_utc > ?
                 ORDER BY event_at_utc ASC
@@ -123,34 +137,63 @@ class EventStorage:
             ).fetchall()
         return [self._row_to_event(row) for row in rows]
 
-    def get_upcoming_events_for_chat(self, chat_id: int) -> list[Event]:
+    def get_upcoming_events_for_chat(
+        self, chat_id: int, message_thread_id: int | None
+    ) -> list[Event]:
         now_iso = datetime.now(timezone.utc).isoformat()
         with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT id, chat_id, created_by_user_id, created_by_name, title, event_at_utc
-                FROM events
-                WHERE chat_id = ? AND event_at_utc > ?
-                ORDER BY event_at_utc ASC
-                """,
-                (chat_id, now_iso),
-            ).fetchall()
+            if message_thread_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, event_at_utc
+                    FROM events
+                    WHERE chat_id = ? AND message_thread_id IS NULL AND event_at_utc > ?
+                    ORDER BY event_at_utc ASC
+                    """,
+                    (chat_id, now_iso),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, event_at_utc
+                    FROM events
+                    WHERE chat_id = ? AND message_thread_id = ? AND event_at_utc > ?
+                    ORDER BY event_at_utc ASC
+                    """,
+                    (chat_id, message_thread_id, now_iso),
+                ).fetchall()
         return [self._row_to_event(row) for row in rows]
 
-    def delete_event(self, event_id: int, chat_id: int) -> bool:
+    def delete_event(
+        self, event_id: int, chat_id: int, message_thread_id: int | None
+    ) -> bool:
         with self._connect() as connection:
-            cursor = connection.execute(
-                "DELETE FROM events WHERE id = ? AND chat_id = ?",
-                (event_id, chat_id),
-            )
+            if message_thread_id is None:
+                cursor = connection.execute(
+                    "DELETE FROM events WHERE id = ? AND chat_id = ? AND message_thread_id IS NULL",
+                    (event_id, chat_id),
+                )
+            else:
+                cursor = connection.execute(
+                    "DELETE FROM events WHERE id = ? AND chat_id = ? AND message_thread_id = ?",
+                    (event_id, chat_id, message_thread_id),
+                )
             return cursor.rowcount > 0
 
-    def delete_all_events_for_chat(self, chat_id: int) -> int:
+    def delete_all_events_for_chat(
+        self, chat_id: int, message_thread_id: int | None
+    ) -> int:
         with self._connect() as connection:
-            cursor = connection.execute(
-                "DELETE FROM events WHERE chat_id = ?",
-                (chat_id,),
-            )
+            if message_thread_id is None:
+                cursor = connection.execute(
+                    "DELETE FROM events WHERE chat_id = ? AND message_thread_id IS NULL",
+                    (chat_id,),
+                )
+            else:
+                cursor = connection.execute(
+                    "DELETE FROM events WHERE chat_id = ? AND message_thread_id = ?",
+                    (chat_id, message_thread_id),
+                )
             return cursor.rowcount
 
     @staticmethod
@@ -158,6 +201,7 @@ class EventStorage:
         return Event(
             id=row["id"],
             chat_id=row["chat_id"],
+            message_thread_id=row["message_thread_id"],
             created_by_user_id=row["created_by_user_id"],
             created_by_name=row["created_by_name"],
             title=row["title"],
@@ -191,7 +235,8 @@ class ReminderBot:
         logging.info("Loaded %s upcoming events", len(self.storage.get_upcoming_events()))
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.effective_chat.send_message(
+        await self._reply(
+            update,
             self._help_text(),
             parse_mode=ParseMode.HTML,
         )
@@ -199,21 +244,23 @@ class ReminderBot:
     async def help_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        await update.effective_chat.send_message(
+        await self._reply(
+            update,
             self._help_text(),
             parse_mode=ParseMode.HTML,
         )
 
     async def ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.effective_chat.send_message("pong")
+        await self._reply(update, "pong")
 
     async def list_events(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         chat = update.effective_chat
-        events = self.storage.get_upcoming_events_for_chat(chat.id)
+        thread_id = update.effective_message.message_thread_id if update.effective_message else None
+        events = self.storage.get_upcoming_events_for_chat(chat.id, thread_id)
         if not events:
-            await chat.send_message("Активных событий пока нет.")
+            await self._reply(update, "Активных событий пока нет.")
             return
 
         now_local = datetime.now(self.local_tz)
@@ -229,42 +276,45 @@ class ReminderBot:
                     lines.append(f"  - в момент события: {local_dt.strftime('%d.%m.%Y %H:%M')}")
                 else:
                     lines.append(f"  - за {label}: {remind_at.strftime('%d.%m.%Y %H:%M')}")
-        await chat.send_message("\n".join(lines))
+        await self._reply(update, "\n".join(lines))
 
     async def delete_event(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         chat = update.effective_chat
         if not context.args:
-            await chat.send_message("Использование: /delete <id>")
+            await self._reply(update, "Использование: /delete <id>")
             return
 
         try:
             event_id = int(context.args[0])
         except ValueError:
-            await chat.send_message("ID должен быть числом. Пример: /delete 3")
+            await self._reply(update, "ID должен быть числом. Пример: /delete 3")
             return
 
-        deleted = self.storage.delete_event(event_id, chat.id)
+        thread_id = update.effective_message.message_thread_id if update.effective_message else None
+        deleted = self.storage.delete_event(event_id, chat.id, thread_id)
         if not deleted:
-            await chat.send_message("Событие не найдено.")
+            await self._reply(update, "Событие не найдено.")
             return
 
         self._remove_jobs_for_event(event_id)
-        await chat.send_message(f"Событие #{event_id} удалено.")
+        await self._reply(update, f"Событие #{event_id} удалено.")
 
     async def delete_all_events(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         chat = update.effective_chat
-        deleted_count = self.storage.delete_all_events_for_chat(chat.id)
-        self._remove_jobs_for_chat(chat.id)
+        thread_id = update.effective_message.message_thread_id if update.effective_message else None
+        deleted_count = self.storage.delete_all_events_for_chat(chat.id, thread_id)
+        self._remove_jobs_for_chat(chat.id, thread_id)
 
         if deleted_count == 0:
-            await chat.send_message("Активных событий для удаления нет.")
+            await self._reply(update, "Активных событий для удаления нет.")
             return
 
-        await chat.send_message(
+        await self._reply(
+            update,
             f"Удалены все события и напоминания в этом чате: {deleted_count} шт."
         )
 
@@ -286,7 +336,8 @@ class ReminderBot:
 
         parsed = self._parse_event_message(message.text)
         if not parsed:
-            await chat.send_message(
+            await self._reply(
+                update,
                 "Не понял формат. Отправь сообщение так:\n"
                 "<code>16.03.2026 18:30 Встреча с командой</code>",
                 parse_mode=ParseMode.HTML,
@@ -296,11 +347,12 @@ class ReminderBot:
         local_dt, title = parsed
         now_local = datetime.now(self.local_tz)
         if local_dt <= now_local:
-            await chat.send_message("Дата события уже в прошлом. Укажи будущее время.")
+            await self._reply(update, "Дата события уже в прошлом. Укажи будущее время.")
             return
 
         event = self.storage.add_event(
             chat_id=chat.id,
+            message_thread_id=message.message_thread_id,
             created_by_user_id=user.id,
             created_by_name=user.full_name,
             title=title,
@@ -316,7 +368,8 @@ class ReminderBot:
                 reminders.append(label)
 
         reminder_text = ", ".join(reminders) if reminders else "нет доступных напоминаний"
-        await chat.send_message(
+        await self._reply(
+            update,
             "Событие сохранено, напоминания установлены.\n"
             f"ID: #{event.id}\n"
             f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')} ({self.local_tz.key})\n"
@@ -353,6 +406,7 @@ class ReminderBot:
                 data={
                     "event_id": event.id,
                     "chat_id": event.chat_id,
+                    "message_thread_id": event.message_thread_id,
                     "title": event.title,
                     "event_at_utc": event.event_at_utc.isoformat(),
                     "created_by_name": event.created_by_name,
@@ -365,6 +419,7 @@ class ReminderBot:
         event_at = datetime.fromisoformat(job_data["event_at_utc"]).astimezone(self.local_tz)
         await context.bot.send_message(
             chat_id=job_data["chat_id"],
+            message_thread_id=job_data["message_thread_id"],
             text=(
                 (
                     f"Событие начинается сейчас\n"
@@ -384,15 +439,31 @@ class ReminderBot:
     ) -> None:
         logging.exception("Unhandled error while processing update", exc_info=context.error)
 
+    async def _reply(self, update: Update, text: str, **kwargs: object) -> None:
+        chat = update.effective_chat
+        message = update.effective_message
+        if not chat:
+            return
+
+        if message and message.message_thread_id is not None:
+            kwargs["message_thread_id"] = message.message_thread_id
+
+        await chat.send_message(text, **kwargs)
+
     def _remove_jobs_for_event(self, event_id: int) -> None:
         for job in self.application.job_queue.jobs():
             if job.name.startswith(f"event:{event_id}:"):
                 job.schedule_removal()
 
-    def _remove_jobs_for_chat(self, chat_id: int) -> None:
+    def _remove_jobs_for_chat(
+        self, chat_id: int, message_thread_id: int | None
+    ) -> None:
         for job in self.application.job_queue.jobs():
             job_data = job.data or {}
-            if job_data.get("chat_id") == chat_id:
+            if (
+                job_data.get("chat_id") == chat_id
+                and job_data.get("message_thread_id") == message_thread_id
+            ):
                 job.schedule_removal()
 
     @staticmethod

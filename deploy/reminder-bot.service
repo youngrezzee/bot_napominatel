@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Reminder Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/bot_napominatel
+EnvironmentFile=/root/bot_napominatel/.env
+ExecStart=/root/bot_napominatel/.venv/bin/python /root/bot_napominatel/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

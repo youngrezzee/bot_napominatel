@@ -35,6 +35,18 @@
 - `/delete <id>` - удалить одно событие по ID
 - `/delete_all` - удалить все события и напоминания в текущем чате или теме
 
+`id` события можно узнать через `/list`. Бот показывает события в таком формате:
+
+```text
+#3 • 17.03.2026 15:00 • Тест
+```
+
+Здесь `3` и есть ID для команды:
+
+```text
+/delete 3
+```
+
 ## Формат события
 
 Поддерживается формат:
@@ -109,10 +121,62 @@ export BOT_TIMEZONE="Europe/Moscow"
 python3 bot.py
 ```
 
-Если на Debian/Ubuntu появляется ошибка про `ensurepip is not available`, нужно установить пакет `python3-venv` или пакет для версии Python, например:
+Если на Debian/Ubuntu появляется ошибка про `ensurepip is not available`, установи пакет:
+
+```bash
+sudo apt install -y python3-venv
+```
+
+или пакет для конкретной версии Python, например:
 
 ```bash
 sudo apt install -y python3.10-venv
+```
+
+## Запуск как процесс через systemd
+
+В репозитории уже есть готовые файлы:
+
+- `deploy/reminder-bot.service`
+- `.env.example`
+
+1. Подготовь env-файл:
+
+```bash
+cd ~/bot_napominatel
+cp .env.example .env
+nano .env
+```
+
+Пример содержимого:
+
+```bash
+TELEGRAM_BOT_TOKEN=твой_токен
+BOT_TIMEZONE=Europe/Moscow
+```
+
+2. Если проект лежит не в `/root/bot_napominatel`, открой `deploy/reminder-bot.service` и исправь пути:
+
+- `WorkingDirectory`
+- `EnvironmentFile`
+- `ExecStart`
+
+3. Установи сервис:
+
+```bash
+sudo cp deploy/reminder-bot.service /etc/systemd/system/reminder-bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable reminder-bot
+sudo systemctl start reminder-bot
+```
+
+4. Команды управления сервисом:
+
+```bash
+sudo systemctl status reminder-bot
+sudo systemctl restart reminder-bot
+sudo systemctl stop reminder-bot
+sudo journalctl -u reminder-bot -f
 ```
 
 ## Обновление на сервере
@@ -122,9 +186,10 @@ cd ~/bot_napominatel
 git pull
 source .venv/bin/activate
 pip install -r requirements.txt
+sudo systemctl restart reminder-bot
 ```
 
-После этого перезапусти процесс бота или сервис.
+Если бот запущен не через `systemd`, просто перезапусти процесс вручную.
 
 ## Хранение данных
 
@@ -137,4 +202,4 @@ pip install -r requirements.txt
 - добавить поддержку естественного ввода даты
 - ограничить удаление события только его автором
 - добавить Docker
-- добавить systemd unit для автозапуска
+- добавить уведомление с кнопками управления

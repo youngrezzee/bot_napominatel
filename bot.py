@@ -27,6 +27,7 @@ REMINDER_OFFSETS = (
     ("1 день", timedelta(days=1)),
     ("3 часа", timedelta(hours=3)),
     ("1 час", timedelta(hours=1)),
+    ("момент события", timedelta()),
 )
 
 
@@ -268,10 +269,12 @@ class ReminderBot:
         for label, delta in REMINDER_OFFSETS:
             if local_dt - delta > now_local:
                 reminders.append(label)
+            elif delta == timedelta():
+                reminders.append(label)
 
-        reminder_text = ", ".join(reminders) if reminders else "только в момент события не напоминает"
+        reminder_text = ", ".join(reminders) if reminders else "нет доступных напоминаний"
         await chat.send_message(
-            "Событие сохранено.\n"
+            "Событие сохранено, напоминания установлены.\n"
             f"ID: #{event.id}\n"
             f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')} ({self.local_tz.key})\n"
             f"Что: {title}\n"
@@ -320,10 +323,16 @@ class ReminderBot:
         await context.bot.send_message(
             chat_id=job_data["chat_id"],
             text=(
-                f"Напоминание: через {job_data['offset_label']} событие\n"
-                f"«{job_data['title']}»\n"
-                f"Когда: {event_at.strftime('%d.%m.%Y %H:%M')} ({self.local_tz.key})\n"
-                f"Создал: {job_data['created_by_name']}"
+                (
+                    f"Событие начинается сейчас\n"
+                    if job_data["offset_label"] == "момент события"
+                    else f"Напоминание: через {job_data['offset_label']} событие\n"
+                )
+                + (
+                    f"«{job_data['title']}»\n"
+                    f"Когда: {event_at.strftime('%d.%m.%Y %H:%M')} ({self.local_tz.key})\n"
+                    f"Создал: {job_data['created_by_name']}"
+                )
             ),
         )
 

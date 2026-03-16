@@ -145,6 +145,14 @@ class EventStorage:
             )
             return cursor.rowcount > 0
 
+    def delete_all_events_for_chat(self, chat_id: int) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM events WHERE chat_id = ?",
+                (chat_id,),
+            )
+            return cursor.rowcount
+
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> Event:
         return Event(
@@ -169,6 +177,7 @@ class ReminderBot:
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("list", self.list_events))
         self.application.add_handler(CommandHandler("delete", self.delete_event))
+        self.application.add_handler(CommandHandler("delete_all", self.delete_all_events))
         self.application.add_handler(CommandHandler("ping", self.ping))
         self.application.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message)
@@ -207,12 +216,19 @@ class ReminderBot:
             await chat.send_message("Активных событий пока нет.")
             return
 
-        lines = ["Ближайшие события:"]
+        now_local = datetime.now(self.local_tz)
+        lines = ["Ближайшие события и напоминания:"]
         for event in events[:20]:
             local_dt = event.event_at_utc.astimezone(self.local_tz)
-            lines.append(
-                f"#{event.id} • {local_dt.strftime('%d.%m.%Y %H:%M')} • {event.title}"
-            )
+            lines.append(f"#{event.id} • {local_dt.strftime('%d.%m.%Y %H:%M')} • {event.title}")
+            for label, delta in REMINDER_OFFSETS:
+                remind_at = local_dt - delta
+                if remind_at <= now_local:
+                    continue
+                if label == "момент события":
+                    lines.append(f"  - в момент события: {local_dt.strftime('%d.%m.%Y %H:%M')}")
+                else:
+                    lines.append(f"  - за {label}: {remind_at.strftime('%d.%m.%Y %H:%M')}")
         await chat.send_message("\n".join(lines))
 
     async def delete_event(
@@ -236,6 +252,21 @@ class ReminderBot:
 
         self._remove_jobs_for_event(event_id)
         await chat.send_message(f"Событие #{event_id} удалено.")
+
+    async def delete_all_events(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        chat = update.effective_chat
+        deleted_count = self.storage.delete_all_events_for_chat(chat.id)
+        self._remove_jobs_for_chat(chat.id)
+
+        if deleted_count == 0:
+            await chat.send_message("Активных событий для удаления нет.")
+            return
+
+        await chat.send_message(
+            f"Удалены все события и напоминания в этом чате: {deleted_count} шт."
+        )
 
     async def handle_text_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -358,6 +389,12 @@ class ReminderBot:
             if job.name.startswith(f"event:{event_id}:"):
                 job.schedule_removal()
 
+    def _remove_jobs_for_chat(self, chat_id: int) -> None:
+        for job in self.application.job_queue.jobs():
+            job_data = job.data or {}
+            if job_data.get("chat_id") == chat_id:
+                job.schedule_removal()
+
     @staticmethod
     def _job_name(event_id: int, label: str) -> str:
         safe_label = label.replace(" ", "_")
@@ -369,8 +406,9 @@ class ReminderBot:
             "Формат сообщения:\n"
             "<code>16.03.2026 18:30 Встреча с командой</code>\n\n"
             "Команды:\n"
-            "/list - показать ближайшие события\n"
+            "/list - показать события и все будущие напоминания\n"
             "/delete ID - удалить событие\n"
+            "/delete_all - удалить все события и напоминания в чате\n"
             "/help - показать подсказку\n\n"
             f"Часовой пояс бота: <b>{self.local_tz.key}</b>"
         )

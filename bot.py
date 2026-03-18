@@ -34,6 +34,7 @@ CLEANUP_DELAY_SECONDS = 60
 LIST_CLEANUP_DELAY_SECONDS = 120
 DAY_REMINDER_DELETE_DELAY = timedelta(hours=8)
 MONTHLY_REMINDER_CLEANUP_INTERVAL = timedelta(days=30)
+DATABASE_CLEANUP_INTERVAL = timedelta(days=180)
 
 
 @dataclass(slots=True)
@@ -262,6 +263,39 @@ class EventStorage:
                 (datetime.now(timezone.utc).isoformat(), reminder_id),
             )
 
+    def cleanup_old_data(self, cutoff_utc: datetime) -> tuple[int, int]:
+        cutoff_iso = cutoff_utc.isoformat()
+        with self._connect() as connection:
+            old_event_ids = [
+                row["id"]
+                for row in connection.execute(
+                    """
+                    SELECT id
+                    FROM events
+                    WHERE event_at_utc < ?
+                    """,
+                    (cutoff_iso,),
+                ).fetchall()
+            ]
+
+            reminders_deleted = connection.execute(
+                """
+                DELETE FROM reminder_messages
+                WHERE event_at_utc < ?
+                """,
+                (cutoff_iso,),
+            ).rowcount
+
+            events_deleted = connection.execute(
+                """
+                DELETE FROM events
+                WHERE event_at_utc < ?
+                """,
+                (cutoff_iso,),
+            ).rowcount
+
+        return events_deleted, reminders_deleted
+
     def add_event(
         self,
         chat_id: int,
@@ -454,6 +488,12 @@ class ReminderBot:
             interval=MONTHLY_REMINDER_CLEANUP_INTERVAL,
             first=MONTHLY_REMINDER_CLEANUP_INTERVAL,
             name="monthly_reminder_cleanup",
+        )
+        self.application.job_queue.run_repeating(
+            self.run_database_cleanup,
+            interval=DATABASE_CLEANUP_INTERVAL,
+            first=DATABASE_CLEANUP_INTERVAL,
+            name="database_cleanup",
         )
         logging.info("Loaded %s upcoming events", len(self.storage.get_upcoming_events()))
 
@@ -1002,6 +1042,18 @@ class ReminderBot:
                 )
             finally:
                 self.storage.mark_reminder_message_deleted(reminder_message.id)
+
+    async def run_database_cleanup(
+        self, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        cutoff_utc = datetime.now(timezone.utc) - DATABASE_CLEANUP_INTERVAL
+        events_deleted, reminders_deleted = self.storage.cleanup_old_data(cutoff_utc)
+        logging.info(
+            "Database cleanup completed | events_deleted=%s | reminders_deleted=%s | cutoff=%s",
+            events_deleted,
+            reminders_deleted,
+            cutoff_utc.isoformat(),
+        )
 
     async def _reply(
         self,

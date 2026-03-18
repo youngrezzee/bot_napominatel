@@ -187,6 +187,35 @@ sudo apt install -y python3.10-venv
 
 - `deploy/reminder-bot.service`
 - `.env.example`
+- `deploy/install.sh`
+- `deploy/bootstrap.sh`
+
+Самый быстрый сценарий для свежего VPS:
+
+1. Зайти на чистый сервер.
+2. Выполнить одну команду:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/youngrezzee/bot_napominatel/main/deploy/bootstrap.sh | sudo bash
+```
+
+Дальше скрипт сам:
+
+- спросит токен бота
+- спросит часовой пояс
+- поставит системные пакеты
+- скачает репозиторий
+- создаст `.venv`
+- установит Python-зависимости
+- создаст `.env`
+- сгенерирует `systemd`-сервис
+- включит и запустит `reminder-bot`
+
+Если репозиторий уже скачан локально и нужен только локальный installer, можно запустить:
+
+```bash
+sudo bash deploy/install.sh
+```
 
 1. Подготовь env-файл:
 

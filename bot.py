@@ -30,6 +30,13 @@ REMINDER_OFFSETS = (
     ("1 час", timedelta(hours=1)),
     ("момент события", timedelta()),
 )
+REMINDER_LABEL_TO_CODE = {
+    "1 день": "day1",
+    "3 часа": "hour3",
+    "1 час": "hour1",
+    "момент события": "now",
+}
+REMINDER_CODE_TO_LABEL = {code: label for label, code in REMINDER_LABEL_TO_CODE.items()}
 CLEANUP_DELAY_SECONDS = 60
 LIST_CLEANUP_DELAY_SECONDS = 120
 DAY_REMINDER_DELETE_DELAY = timedelta(hours=8)
@@ -46,6 +53,7 @@ class Event:
     created_by_name: str
     title: str
     mention_usernames: str
+    reminder_labels: str
     event_at_utc: datetime
 
 
@@ -59,6 +67,7 @@ class PendingEvent:
     local_dt: datetime
     source_message_id: int | None
     selected_usernames: set[str]
+    selected_reminder_labels: set[str]
 
 
 @dataclass(slots=True)
@@ -95,6 +104,7 @@ class EventStorage:
                     created_by_name TEXT NOT NULL,
                     title TEXT NOT NULL,
                     mention_usernames TEXT NOT NULL DEFAULT '',
+                    reminder_labels TEXT NOT NULL DEFAULT '',
                     event_at_utc TEXT NOT NULL,
                     created_at_utc TEXT NOT NULL
                 )
@@ -138,6 +148,10 @@ class EventStorage:
             if "mention_usernames" not in columns:
                 connection.execute(
                     "ALTER TABLE events ADD COLUMN mention_usernames TEXT NOT NULL DEFAULT ''"
+                )
+            if "reminder_labels" not in columns:
+                connection.execute(
+                    "ALTER TABLE events ADD COLUMN reminder_labels TEXT NOT NULL DEFAULT ''"
                 )
 
     def upsert_chat_user(
@@ -304,6 +318,7 @@ class EventStorage:
         created_by_name: str,
         title: str,
         mention_usernames: str,
+        reminder_labels: str,
         event_at_utc: datetime,
     ) -> Event:
         event_iso = event_at_utc.astimezone(timezone.utc).isoformat()
@@ -318,9 +333,10 @@ class EventStorage:
                     created_by_name,
                     title,
                     mention_usernames,
+                    reminder_labels,
                     event_at_utc,
                     created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chat_id,
@@ -329,6 +345,7 @@ class EventStorage:
                     created_by_name,
                     title,
                     mention_usernames,
+                    reminder_labels,
                     event_iso,
                     created_iso,
                 ),
@@ -343,6 +360,7 @@ class EventStorage:
             created_by_name=created_by_name,
             title=title,
             mention_usernames=mention_usernames,
+            reminder_labels=reminder_labels,
             event_at_utc=datetime.fromisoformat(event_iso),
         )
 
@@ -351,7 +369,7 @@ class EventStorage:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, mention_usernames, event_at_utc
+                SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, mention_usernames, reminder_labels, event_at_utc
                 FROM events
                 WHERE event_at_utc > ?
                 ORDER BY event_at_utc ASC
@@ -368,7 +386,7 @@ class EventStorage:
             if message_thread_id is None:
                 rows = connection.execute(
                     """
-                    SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, mention_usernames, event_at_utc
+                    SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, mention_usernames, reminder_labels, event_at_utc
                     FROM events
                     WHERE chat_id = ? AND message_thread_id IS NULL AND event_at_utc > ?
                     ORDER BY event_at_utc ASC
@@ -378,7 +396,7 @@ class EventStorage:
             else:
                 rows = connection.execute(
                     """
-                    SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, mention_usernames, event_at_utc
+                    SELECT id, chat_id, message_thread_id, created_by_user_id, created_by_name, title, mention_usernames, reminder_labels, event_at_utc
                     FROM events
                     WHERE chat_id = ? AND message_thread_id = ? AND event_at_utc > ?
                     ORDER BY event_at_utc ASC
@@ -429,6 +447,7 @@ class EventStorage:
             created_by_name=row["created_by_name"],
             title=row["title"],
             mention_usernames=row["mention_usernames"],
+            reminder_labels=row["reminder_labels"],
             event_at_utc=datetime.fromisoformat(row["event_at_utc"]),
         )
 
@@ -470,7 +489,7 @@ class ReminderBot:
         self.application.add_handler(CommandHandler("delete_all", self.delete_all_events))
         self.application.add_handler(CommandHandler("ping", self.ping))
         self.application.add_handler(
-            CallbackQueryHandler(self.handle_callback_query, pattern=r"^mentions:")
+            CallbackQueryHandler(self.handle_callback_query, pattern=r"^(mentions|periods):")
         )
         self.application.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message)
@@ -539,7 +558,12 @@ class ReminderBot:
             lines.append(f"#{event.id} • {local_dt.strftime('%d.%m.%Y %H:%M')} • {event.title}")
             if event.mention_usernames:
                 lines.append(f"  - теги: {event.mention_usernames}")
+            lines.append(
+                f"  - периоды: {', '.join(self._get_active_reminder_labels(event))}"
+            )
             for label, delta in REMINDER_OFFSETS:
+                if label not in self._get_active_reminder_labels(event):
+                    continue
                 remind_at = local_dt - delta
                 if remind_at <= now_local:
                     continue
@@ -677,6 +701,7 @@ class ReminderBot:
             local_dt=local_dt,
             source_message_id=message.message_id,
             selected_usernames=set(mention_usernames.split()) if mention_usernames else set(),
+            selected_reminder_labels=set(),
         )
         self.pending_events[draft_id] = pending_event
 
@@ -723,7 +748,10 @@ class ReminderBot:
         return title_text.strip(), unique_usernames
 
     def schedule_event_reminders(self, event: Event) -> None:
+        active_labels = self._get_active_reminder_labels(event)
         for label, delta in REMINDER_OFFSETS:
+            if label not in active_labels:
+                continue
             remind_at = event.event_at_utc - delta
             if remind_at <= datetime.now(timezone.utc):
                 continue
@@ -744,6 +772,16 @@ class ReminderBot:
                     "offset_label": label,
                 },
             )
+
+    def _get_active_reminder_labels(self, event: Event) -> list[str]:
+        if not event.reminder_labels.strip():
+            return [label for label, _ in REMINDER_OFFSETS]
+        selected = {
+            label.strip()
+            for label in event.reminder_labels.split("|")
+            if label.strip()
+        }
+        return [label for label, _ in REMINDER_OFFSETS if label in selected]
 
     async def handle_callback_query(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -783,11 +821,49 @@ class ReminderBot:
 
         if action == "skip":
             pending_event.selected_usernames.clear()
+            await self._show_period_selection(query, draft_id, pending_event)
+            return
+
+        if action == "done":
+            await self._show_period_selection(query, draft_id, pending_event)
+            return
+
+        if parts[0] != "periods":
+            return
+
+        if action == "toggle" and len(parts) == 4:
+            label = REMINDER_CODE_TO_LABEL.get(parts[3])
+            if not label:
+                return
+            if label in pending_event.selected_reminder_labels:
+                pending_event.selected_reminder_labels.remove(label)
+            else:
+                pending_event.selected_reminder_labels.add(label)
+            keyboard = self._build_periods_keyboard(
+                draft_id,
+                pending_event.selected_reminder_labels,
+            )
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+            return
+
+        if action == "skip":
+            pending_event.selected_reminder_labels.clear()
             await self._finalize_pending_event(update, draft_id, query)
             return
 
         if action == "done":
             await self._finalize_pending_event(update, draft_id, query)
+
+    async def _show_period_selection(self, query, draft_id: str, pending_event: PendingEvent) -> None:
+        keyboard = self._build_periods_keyboard(
+            draft_id,
+            pending_event.selected_reminder_labels,
+        )
+        await query.edit_message_text(
+            "Теперь выбери периоды напоминаний.\n"
+            "Если ничего не отметить, будут выбраны все периоды по умолчанию.",
+            reply_markup=keyboard,
+        )
 
     async def _finalize_pending_event(
         self,
@@ -801,10 +877,12 @@ class ReminderBot:
             return
 
         mention_usernames = " ".join(sorted(pending_event.selected_usernames))
+        reminder_labels = " | ".join(
+            label for label, _ in REMINDER_OFFSETS
+            if label in pending_event.selected_reminder_labels
+        )
         await query.edit_message_text(
-            "Список тегов сохранен."
-            if mention_usernames
-            else "Событие будет без тегов."
+            "Событие настроено."
         )
 
         await self._create_event_and_confirm(
@@ -812,6 +890,7 @@ class ReminderBot:
             local_dt=pending_event.local_dt,
             title=pending_event.title,
             mention_usernames=mention_usernames,
+            reminder_labels=reminder_labels,
             created_by_user_id=pending_event.created_by_user_id,
             created_by_name=pending_event.created_by_name,
             chat_id=pending_event.chat_id,
@@ -860,6 +939,37 @@ class ReminderBot:
         )
         return InlineKeyboardMarkup(rows)
 
+    def _build_periods_keyboard(
+        self,
+        draft_id: str,
+        selected_labels: set[str],
+    ) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        for label, _ in REMINDER_OFFSETS:
+            prefix = "✅ " if label in selected_labels else ""
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{prefix}{label}",
+                        callback_data=f"periods:toggle:{draft_id}:{REMINDER_LABEL_TO_CODE[label]}",
+                    )
+                ]
+            )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Все по умолчанию",
+                    callback_data=f"periods:skip:{draft_id}",
+                ),
+                InlineKeyboardButton(
+                    text="Готово",
+                    callback_data=f"periods:done:{draft_id}",
+                ),
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
+
     async def _get_mention_candidates(self, chat_id: int) -> list[str]:
         try:
             admins = await self.application.bot.get_chat_administrators(chat_id)
@@ -889,6 +999,7 @@ class ReminderBot:
         local_dt: datetime,
         title: str,
         mention_usernames: str,
+        reminder_labels: str = "",
         created_by_user_id: int | None = None,
         created_by_name: str | None = None,
         chat_id: int | None = None,
@@ -907,13 +1018,17 @@ class ReminderBot:
             created_by_name=created_by_name if created_by_name is not None else user.full_name,
             title=title,
             mention_usernames=mention_usernames,
+            reminder_labels=reminder_labels,
             event_at_utc=local_dt.astimezone(timezone.utc),
         )
         self.schedule_event_reminders(event)
 
         now_local = datetime.now(self.local_tz)
         reminders = []
+        active_labels = self._get_active_reminder_labels(event)
         for label, delta in REMINDER_OFFSETS:
+            if label not in active_labels:
+                continue
             if local_dt - delta > now_local:
                 reminders.append(label)
             elif delta == timedelta():
@@ -927,6 +1042,7 @@ class ReminderBot:
             f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')} ({self.local_tz.key})\n"
             f"Что: {title}\n"
             f"Кого тегать: {mention_usernames or 'никого'}\n"
+            f"Периоды: {', '.join(active_labels)}\n"
             f"Напоминания: {reminder_text}",
             cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
         )
@@ -1144,6 +1260,8 @@ class ReminderBot:
             "Формат сообщения:\n"
             "<code>16.03.2026 18:30 Встреча с командой</code>\n"
             "<code>16.03.2026 18:30 Встреча с командой | @nikita @anastasia</code>\n\n"
+            "В группах после выбора людей я отдельно спрошу периоды напоминаний.\n"
+            "Если периоды не выбрать, будут включены все по умолчанию.\n\n"
             "Команды:\n"
             "/list - показать события и все будущие напоминания\n"
             "/delete ID - удалить событие\n"

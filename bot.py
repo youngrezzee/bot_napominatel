@@ -795,7 +795,7 @@ class ReminderBot:
         if len(parts) < 3:
             return
 
-        _, action, draft_id = parts[0], parts[1], parts[2]
+        callback_kind, action, draft_id = parts[0], parts[1], parts[2]
         pending_event = self.pending_events.get(draft_id)
         if not pending_event:
             await query.edit_message_text("Черновик события уже истек. Отправь событие заново.")
@@ -805,30 +805,33 @@ class ReminderBot:
             await query.answer("Выбирать теги может только автор события.", show_alert=True)
             return
 
-        if action == "toggle" and len(parts) == 4:
-            username = parts[3]
-            if username in pending_event.selected_usernames:
-                pending_event.selected_usernames.remove(username)
-            else:
-                pending_event.selected_usernames.add(username)
-            keyboard = await self._build_mentions_keyboard(
-                pending_event.chat_id,
-                draft_id,
-                pending_event.selected_usernames,
-            )
-            await query.edit_message_reply_markup(reply_markup=keyboard)
+        if callback_kind == "mentions":
+            if action == "toggle" and len(parts) == 4:
+                username = parts[3]
+                if username in pending_event.selected_usernames:
+                    pending_event.selected_usernames.remove(username)
+                else:
+                    pending_event.selected_usernames.add(username)
+                keyboard = await self._build_mentions_keyboard(
+                    pending_event.chat_id,
+                    draft_id,
+                    pending_event.selected_usernames,
+                )
+                await query.edit_message_reply_markup(reply_markup=keyboard)
+                return
+
+            if action == "skip":
+                pending_event.selected_usernames.clear()
+                await self._show_period_selection(query, draft_id, pending_event)
+                return
+
+            if action == "done":
+                await self._show_period_selection(query, draft_id, pending_event)
+                return
+
             return
 
-        if action == "skip":
-            pending_event.selected_usernames.clear()
-            await self._show_period_selection(query, draft_id, pending_event)
-            return
-
-        if action == "done":
-            await self._show_period_selection(query, draft_id, pending_event)
-            return
-
-        if parts[0] != "periods":
+        if callback_kind != "periods":
             return
 
         if action == "toggle" and len(parts) == 4:

@@ -6,6 +6,8 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SERVICE_PATH="/etc/systemd/system/reminder-bot.service"
 TOKEN="${1:-${TELEGRAM_BOT_TOKEN:-}}"
 TIMEZONE_VALUE="${BOT_TIMEZONE:-Europe/Moscow}"
+ALLOWED_CHAT_IDS_VALUE="${BOT_ALLOWED_CHAT_IDS:-}"
+ALLOWED_THREAD_IDS_VALUE="${BOT_ALLOWED_THREAD_IDS:-}"
 
 if [[ -z "${TOKEN}" ]]; then
   read -r -p "Enter Telegram bot token: " TOKEN
@@ -47,11 +49,17 @@ echo "[3/6] Installing Python dependencies"
 
 read -r -p "Timezone [${TIMEZONE_VALUE}]: " INPUT_TIMEZONE
 TIMEZONE_VALUE="${INPUT_TIMEZONE:-${TIMEZONE_VALUE}}"
+read -r -p "Allowed chat IDs, comma-separated [${ALLOWED_CHAT_IDS_VALUE}]: " INPUT_ALLOWED_CHAT_IDS
+ALLOWED_CHAT_IDS_VALUE="${INPUT_ALLOWED_CHAT_IDS:-${ALLOWED_CHAT_IDS_VALUE}}"
+read -r -p "Allowed topic/thread IDs, comma-separated [${ALLOWED_THREAD_IDS_VALUE}]: " INPUT_ALLOWED_THREAD_IDS
+ALLOWED_THREAD_IDS_VALUE="${INPUT_ALLOWED_THREAD_IDS:-${ALLOWED_THREAD_IDS_VALUE}}"
 
 echo "[4/6] Writing .env"
 cat > "${REPO_DIR}/.env" <<EOF
 TELEGRAM_BOT_TOKEN=${TOKEN}
 BOT_TIMEZONE=${TIMEZONE_VALUE}
+BOT_ALLOWED_CHAT_IDS=${ALLOWED_CHAT_IDS_VALUE}
+BOT_ALLOWED_THREAD_IDS=${ALLOWED_THREAD_IDS_VALUE}
 EOF
 
 echo "[5/6] Creating systemd service"

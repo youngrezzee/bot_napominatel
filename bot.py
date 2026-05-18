@@ -75,6 +75,7 @@ class ReminderMessage:
     id: int
     event_id: int
     chat_id: int
+    message_thread_id: int | None
     message_id: int
     offset_label: str
     event_at_utc: datetime
@@ -128,6 +129,7 @@ class EventStorage:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_id INTEGER NOT NULL,
                     chat_id INTEGER NOT NULL,
+                    message_thread_id INTEGER,
                     message_id INTEGER NOT NULL,
                     offset_label TEXT NOT NULL,
                     event_at_utc TEXT NOT NULL,
@@ -152,6 +154,14 @@ class EventStorage:
             if "reminder_labels" not in columns:
                 connection.execute(
                     "ALTER TABLE events ADD COLUMN reminder_labels TEXT NOT NULL DEFAULT ''"
+                )
+            reminder_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(reminder_messages)").fetchall()
+            }
+            if "message_thread_id" not in reminder_columns:
+                connection.execute(
+                    "ALTER TABLE reminder_messages ADD COLUMN message_thread_id INTEGER"
                 )
 
     def upsert_chat_user(
@@ -196,6 +206,7 @@ class EventStorage:
         self,
         event_id: int,
         chat_id: int,
+        message_thread_id: int | None,
         message_id: int,
         offset_label: str,
         event_at_utc: datetime,
@@ -209,17 +220,19 @@ class EventStorage:
                 INSERT INTO reminder_messages (
                     event_id,
                     chat_id,
+                    message_thread_id,
                     message_id,
                     offset_label,
                     event_at_utc,
                     delete_at_utc,
                     deleted_at_utc,
                     created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
                 """,
                 (
                     event_id,
                     chat_id,
+                    message_thread_id,
                     message_id,
                     offset_label,
                     event_at_utc.isoformat(),
@@ -233,6 +246,7 @@ class EventStorage:
             id=reminder_id,
             event_id=event_id,
             chat_id=chat_id,
+            message_thread_id=message_thread_id,
             message_id=message_id,
             offset_label=offset_label,
             event_at_utc=event_at_utc,
@@ -244,7 +258,7 @@ class EventStorage:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, event_id, chat_id, message_id, offset_label, event_at_utc, delete_at_utc, deleted_at_utc
+                SELECT id, event_id, chat_id, message_thread_id, message_id, offset_label, event_at_utc, delete_at_utc, deleted_at_utc
                 FROM reminder_messages
                 WHERE deleted_at_utc IS NULL AND delete_at_utc IS NOT NULL
                 ORDER BY delete_at_utc ASC
@@ -257,7 +271,7 @@ class EventStorage:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, event_id, chat_id, message_id, offset_label, event_at_utc, delete_at_utc, deleted_at_utc
+                SELECT id, event_id, chat_id, message_thread_id, message_id, offset_label, event_at_utc, delete_at_utc, deleted_at_utc
                 FROM reminder_messages
                 WHERE deleted_at_utc IS NULL AND event_at_utc < ?
                 ORDER BY event_at_utc ASC
@@ -457,6 +471,7 @@ class EventStorage:
             id=row["id"],
             event_id=row["event_id"],
             chat_id=row["chat_id"],
+            message_thread_id=row["message_thread_id"],
             message_id=row["message_id"],
             offset_label=row["offset_label"],
             event_at_utc=datetime.fromisoformat(row["event_at_utc"]),
@@ -474,9 +489,18 @@ class EventStorage:
 
 
 class ReminderBot:
-    def __init__(self, token: str, db_path: Path, local_tz_name: str) -> None:
+    def __init__(
+        self,
+        token: str,
+        db_path: Path,
+        local_tz_name: str,
+        allowed_chat_ids: set[int] | None = None,
+        allowed_thread_ids: set[int] | None = None,
+    ) -> None:
         self.local_tz = ZoneInfo(local_tz_name)
         self.storage = EventStorage(db_path)
+        self.allowed_chat_ids = allowed_chat_ids
+        self.allowed_thread_ids = allowed_thread_ids
         self.application: Application = ApplicationBuilder().token(token).build()
         self.pending_events: dict[str, PendingEvent] = {}
         self._register_handlers()
@@ -499,8 +523,27 @@ class ReminderBot:
 
     async def on_startup(self, application: Application) -> None:
         for event in self.storage.get_upcoming_events():
+            if not self._is_target_allowed(event.chat_id, event.message_thread_id):
+                logging.info(
+                    "Skip event %s from disallowed target chat=%s thread=%s",
+                    event.id,
+                    event.chat_id,
+                    event.message_thread_id,
+                )
+                continue
             self.schedule_event_reminders(event)
         for reminder_message in self.storage.get_pending_reminder_cleanups():
+            if not self._is_target_allowed(
+                reminder_message.chat_id,
+                reminder_message.message_thread_id,
+            ):
+                logging.info(
+                    "Skip reminder cleanup %s from disallowed target chat=%s thread=%s",
+                    reminder_message.id,
+                    reminder_message.chat_id,
+                    reminder_message.message_thread_id,
+                )
+                continue
             self.schedule_reminder_message_cleanup(reminder_message)
         self.application.job_queue.run_repeating(
             self.run_monthly_reminder_cleanup,
@@ -517,6 +560,8 @@ class ReminderBot:
         logging.info("Loaded %s upcoming events", len(self.storage.get_upcoming_events()))
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_update_allowed(update):
+            return
         await self._reply(
             update,
             self._help_text(),
@@ -527,6 +572,8 @@ class ReminderBot:
     async def help_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        if not self._is_update_allowed(update):
+            return
         await self._reply(
             update,
             self._help_text(),
@@ -535,11 +582,15 @@ class ReminderBot:
         )
 
     async def ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_update_allowed(update):
+            return
         await self._reply(update, "pong", cleanup_delay_seconds=CLEANUP_DELAY_SECONDS)
 
     async def list_events(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        if not self._is_update_allowed(update):
+            return
         chat = update.effective_chat
         thread_id = update.effective_message.message_thread_id if update.effective_message else None
         events = self.storage.get_upcoming_events_for_chat(chat.id, thread_id)
@@ -580,6 +631,8 @@ class ReminderBot:
     async def delete_event(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        if not self._is_update_allowed(update):
+            return
         chat = update.effective_chat
         if not context.args:
             await self._reply(
@@ -619,6 +672,8 @@ class ReminderBot:
     async def delete_all_events(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        if not self._is_update_allowed(update):
+            return
         chat = update.effective_chat
         thread_id = update.effective_message.message_thread_id if update.effective_message else None
         deleted_count = self.storage.delete_all_events_for_chat(chat.id, thread_id)
@@ -646,6 +701,13 @@ class ReminderBot:
         user = update.effective_user
         if not message or not message.text or not chat or not user:
             return
+        if not self._is_target_allowed(chat.id, message.message_thread_id):
+            logging.info(
+                "Ignored text from disallowed target chat=%s thread=%s",
+                chat.id,
+                message.message_thread_id,
+            )
+            return
 
         self.storage.upsert_chat_user(
             chat_id=chat.id,
@@ -655,8 +717,9 @@ class ReminderBot:
         )
 
         logging.info(
-            "Incoming text | chat_id=%s | user_id=%s | text=%r",
+            "Incoming text | chat_id=%s | thread_id=%s | user_id=%s | text=%r",
             chat.id,
+            message.message_thread_id,
             user.id,
             message.text,
         )
@@ -748,6 +811,14 @@ class ReminderBot:
         return title_text.strip(), unique_usernames
 
     def schedule_event_reminders(self, event: Event) -> None:
+        if not self._is_target_allowed(event.chat_id, event.message_thread_id):
+            logging.info(
+                "Skip scheduling event %s from disallowed target chat=%s thread=%s",
+                event.id,
+                event.chat_id,
+                event.message_thread_id,
+            )
+            return
         active_labels = self._get_active_reminder_labels(event)
         for label, delta in REMINDER_OFFSETS:
             if label not in active_labels:
@@ -788,6 +859,17 @@ class ReminderBot:
     ) -> None:
         query = update.callback_query
         if not query or not query.data or not query.from_user:
+            return
+        if query.message and not self._is_target_allowed(
+            query.message.chat_id,
+            query.message.message_thread_id,
+        ):
+            logging.info(
+                "Ignored callback from disallowed target chat=%s thread=%s",
+                query.message.chat_id,
+                query.message.message_thread_id,
+            )
+            await query.answer()
             return
 
         await query.answer()
@@ -902,6 +984,7 @@ class ReminderBot:
         if pending_event.source_message_id:
             self._schedule_message_cleanup(
                 chat_id=pending_event.chat_id,
+                message_thread_id=pending_event.message_thread_id,
                 bot_message_id=pending_event.source_message_id,
                 user_message_id=None,
                 delay_seconds=CLEANUP_DELAY_SECONDS,
@@ -1052,6 +1135,16 @@ class ReminderBot:
 
     async def send_reminder(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         job_data = context.job.data
+        if not self._is_target_allowed(
+            job_data["chat_id"],
+            job_data["message_thread_id"],
+        ):
+            logging.info(
+                "Skip reminder for disallowed target chat=%s thread=%s",
+                job_data["chat_id"],
+                job_data["message_thread_id"],
+            )
+            return
         event_at_utc = datetime.fromisoformat(job_data["event_at_utc"])
         event_at = event_at_utc.astimezone(self.local_tz)
         reminder_text = (
@@ -1083,6 +1176,7 @@ class ReminderBot:
         reminder_message = self.storage.add_reminder_message(
             event_id=job_data["event_id"],
             chat_id=job_data["chat_id"],
+            message_thread_id=job_data["message_thread_id"],
             message_id=sent_message.message_id,
             offset_label=job_data["offset_label"],
             event_at_utc=event_at_utc,
@@ -1121,6 +1215,7 @@ class ReminderBot:
             data={
                 "reminder_id": reminder_message.id,
                 "chat_id": reminder_message.chat_id,
+                "message_thread_id": reminder_message.message_thread_id,
                 "message_id": reminder_message.message_id,
             },
         )
@@ -1129,6 +1224,16 @@ class ReminderBot:
         self, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         job_data = context.job.data
+        if not self._is_target_allowed(
+            job_data["chat_id"],
+            job_data.get("message_thread_id"),
+        ):
+            logging.info(
+                "Skip reminder deletion for disallowed target chat=%s thread=%s",
+                job_data["chat_id"],
+                job_data.get("message_thread_id"),
+            )
+            return
         try:
             await context.bot.delete_message(
                 chat_id=job_data["chat_id"],
@@ -1148,6 +1253,16 @@ class ReminderBot:
     ) -> None:
         cleanup_candidates = self.storage.get_monthly_cleanup_candidates()
         for reminder_message in cleanup_candidates:
+            if not self._is_target_allowed(
+                reminder_message.chat_id,
+                reminder_message.message_thread_id,
+            ):
+                logging.info(
+                    "Skip monthly cleanup for disallowed target chat=%s thread=%s",
+                    reminder_message.chat_id,
+                    reminder_message.message_thread_id,
+                )
+                continue
             try:
                 await context.bot.delete_message(
                     chat_id=reminder_message.chat_id,
@@ -1183,7 +1298,8 @@ class ReminderBot:
     ) -> None:
         chat = update.effective_chat
         message = update.effective_message
-        if not chat:
+        thread_id = message.message_thread_id if message else None
+        if not chat or not self._is_target_allowed(chat.id, thread_id):
             return
 
         if message and message.message_thread_id is not None:
@@ -1194,6 +1310,7 @@ class ReminderBot:
         if cleanup_delay_seconds and chat.type != "private":
             self._schedule_message_cleanup(
                 chat_id=chat.id,
+                message_thread_id=message.message_thread_id if message else None,
                 bot_message_id=sent_message.message_id,
                 user_message_id=message.message_id if message else None,
                 delay_seconds=cleanup_delay_seconds,
@@ -1202,15 +1319,24 @@ class ReminderBot:
     def _schedule_message_cleanup(
         self,
         chat_id: int,
+        message_thread_id: int | None,
         bot_message_id: int,
         user_message_id: int | None,
         delay_seconds: int,
     ) -> None:
+        if not self._is_target_allowed(chat_id, message_thread_id):
+            logging.info(
+                "Skip message cleanup for disallowed target chat=%s thread=%s",
+                chat_id,
+                message_thread_id,
+            )
+            return
         self.application.job_queue.run_once(
             self.delete_messages,
             when=delay_seconds,
             data={
                 "chat_id": chat_id,
+                "message_thread_id": message_thread_id,
                 "bot_message_id": bot_message_id,
                 "user_message_id": user_message_id,
             },
@@ -1218,6 +1344,16 @@ class ReminderBot:
 
     async def delete_messages(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         job_data = context.job.data
+        if not self._is_target_allowed(
+            job_data["chat_id"],
+            job_data.get("message_thread_id"),
+        ):
+            logging.info(
+                "Skip message deletion for disallowed target chat=%s thread=%s",
+                job_data["chat_id"],
+                job_data.get("message_thread_id"),
+            )
+            return
         for message_id in (
             job_data.get("user_message_id"),
             job_data.get("bot_message_id"),
@@ -1257,6 +1393,32 @@ class ReminderBot:
         safe_label = label.replace(" ", "_")
         return f"event:{event_id}:{safe_label}"
 
+    def _is_chat_allowed(self, chat_id: int) -> bool:
+        return self.allowed_chat_ids is None or chat_id in self.allowed_chat_ids
+
+    def _is_target_allowed(self, chat_id: int, message_thread_id: int | None) -> bool:
+        if not self._is_chat_allowed(chat_id):
+            return False
+        return (
+            self.allowed_thread_ids is None
+            or message_thread_id in self.allowed_thread_ids
+        )
+
+    def _is_update_allowed(self, update: Update) -> bool:
+        chat = update.effective_chat
+        message = update.effective_message
+        if not chat:
+            return False
+        thread_id = message.message_thread_id if message else None
+        if self._is_target_allowed(chat.id, thread_id):
+            return True
+        logging.info(
+            "Ignored update from disallowed target chat=%s thread=%s",
+            chat.id,
+            thread_id,
+        )
+        return False
+
     def _help_text(self) -> str:
         return (
             "Я сохраняю события и напоминаю о них за <b>1 день</b>, <b>3 часа</b> и <b>1 час</b>.\n\n"
@@ -1289,9 +1451,42 @@ def main() -> None:
 
     db_path = Path(os.getenv("BOT_DB_PATH", "events.db"))
     timezone_name = os.getenv("BOT_TIMEZONE", "Europe/Moscow")
+    allowed_chat_ids = _parse_id_set(
+        os.getenv("BOT_ALLOWED_CHAT_IDS"),
+        "BOT_ALLOWED_CHAT_IDS",
+    )
+    allowed_thread_ids = _parse_id_set(
+        os.getenv("BOT_ALLOWED_THREAD_IDS"),
+        "BOT_ALLOWED_THREAD_IDS",
+    )
 
-    bot = ReminderBot(token=token, db_path=db_path, local_tz_name=timezone_name)
+    bot = ReminderBot(
+        token=token,
+        db_path=db_path,
+        local_tz_name=timezone_name,
+        allowed_chat_ids=allowed_chat_ids,
+        allowed_thread_ids=allowed_thread_ids,
+    )
     bot.run()
+
+
+def _parse_id_set(raw_value: str | None, env_name: str) -> set[int] | None:
+    if not raw_value or not raw_value.strip():
+        return None
+
+    ids: set[int] = set()
+    for item in raw_value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            ids.add(int(item))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{env_name} must contain only comma-separated numeric IDs"
+            ) from exc
+
+    return ids or None
 
 
 if __name__ == "__main__":

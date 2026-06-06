@@ -1,14 +1,16 @@
 import asyncio
+import json
 import logging
 import os
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -42,6 +44,8 @@ LIST_CLEANUP_DELAY_SECONDS = 120
 DAY_REMINDER_DELETE_DELAY = timedelta(hours=8)
 MONTHLY_REMINDER_CLEANUP_INTERVAL = timedelta(days=30)
 DATABASE_CLEANUP_INTERVAL = timedelta(days=180)
+BACKUP_TABLES = ("events", "chat_users", "reminder_messages")
+BACKUP_VERSION = 1
 
 
 @dataclass(slots=True)
@@ -81,6 +85,12 @@ class ReminderMessage:
     event_at_utc: datetime
     delete_at_utc: datetime | None
     deleted_at_utc: datetime | None
+
+
+@dataclass(slots=True)
+class BackupBatch:
+    backup_id: str
+    tables: dict[str, dict]
 
 
 class EventStorage:
@@ -324,6 +334,69 @@ class EventStorage:
 
         return events_deleted, reminders_deleted
 
+    def export_table_backup(self, table_name: str, backup_id: str) -> dict:
+        if table_name not in BACKUP_TABLES:
+            raise ValueError(f"Unsupported table: {table_name}")
+
+        with self._connect() as connection:
+            columns = [
+                row["name"]
+                for row in connection.execute(
+                    f"PRAGMA table_info({table_name})"
+                ).fetchall()
+            ]
+            rows = [
+                dict(row)
+                for row in connection.execute(f"SELECT * FROM {table_name}").fetchall()
+            ]
+
+        return {
+            "backup_version": BACKUP_VERSION,
+            "backup_id": backup_id,
+            "table_name": table_name,
+            "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+            "columns": columns,
+            "rows": rows,
+        }
+
+    def restore_from_backups(self, tables: dict[str, dict]) -> dict[str, int]:
+        missing_tables = [table for table in BACKUP_TABLES if table not in tables]
+        if missing_tables:
+            raise ValueError(f"Missing backup tables: {', '.join(missing_tables)}")
+
+        for table_name, payload in tables.items():
+            if payload.get("backup_version") != BACKUP_VERSION:
+                raise ValueError(f"Unsupported backup version for {table_name}")
+            if payload.get("table_name") != table_name:
+                raise ValueError(f"Backup payload/table mismatch for {table_name}")
+
+        delete_order = ("reminder_messages", "events", "chat_users")
+        insert_order = ("events", "chat_users", "reminder_messages")
+        imported_counts: dict[str, int] = {}
+
+        with self._connect() as connection:
+            for table_name in delete_order:
+                connection.execute(f"DELETE FROM {table_name}")
+
+            for table_name in insert_order:
+                payload = tables[table_name]
+                columns = payload.get("columns", [])
+                rows = payload.get("rows", [])
+                if not rows:
+                    imported_counts[table_name] = 0
+                    continue
+
+                placeholders = ", ".join("?" for _ in columns)
+                column_list = ", ".join(columns)
+                values = [[row.get(column) for column in columns] for row in rows]
+                connection.executemany(
+                    f"INSERT INTO {table_name} ({column_list}) VALUES ({placeholders})",
+                    values,
+                )
+                imported_counts[table_name] = len(rows)
+
+        return imported_counts
+
     def add_event(
         self,
         chat_id: int,
@@ -503,17 +576,22 @@ class ReminderBot:
         self.allowed_thread_ids = allowed_thread_ids
         self.application: Application = ApplicationBuilder().token(token).build()
         self.pending_events: dict[str, PendingEvent] = {}
+        self.pending_restore_batches: dict[str, BackupBatch] = {}
         self._register_handlers()
 
     def _register_handlers(self) -> None:
         self.application.add_handler(CommandHandler("start", self.start))
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("list", self.list_events))
+        self.application.add_handler(CommandHandler("backup", self.backup_tables))
         self.application.add_handler(CommandHandler("delete", self.delete_event))
         self.application.add_handler(CommandHandler("delete_all", self.delete_all_events))
         self.application.add_handler(CommandHandler("ping", self.ping))
         self.application.add_handler(
             CallbackQueryHandler(self.handle_callback_query, pattern=r"^(mentions|periods):")
+        )
+        self.application.add_handler(
+            MessageHandler(filters.Document.ALL, self.handle_document_message)
         )
         self.application.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message)
@@ -585,6 +663,37 @@ class ReminderBot:
         if not self._is_update_allowed(update):
             return
         await self._reply(update, "pong", cleanup_delay_seconds=CLEANUP_DELAY_SECONDS)
+
+    async def backup_tables(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not self._is_update_allowed(update):
+            return
+
+        chat = update.effective_chat
+        message = update.effective_message
+        if not chat:
+            return
+
+        backup_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        for table_name in BACKUP_TABLES:
+            payload = self.storage.export_table_backup(table_name, backup_id)
+            buffer = BytesIO(
+                json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+            )
+            filename = f"reminder_bot_backup_{backup_id}_{table_name}.json"
+            buffer.name = filename
+            await chat.send_document(
+                document=InputFile(buffer, filename=filename),
+                message_thread_id=message.message_thread_id if message else None,
+                caption=f"Backup table: {table_name}",
+            )
+
+        await self._reply(
+            update,
+            "Бекап выгружен в чат. Чтобы восстановить бота, отправь сюда эти же JSON-файлы.",
+            cleanup_delay_seconds=CLEANUP_DELAY_SECONDS,
+        )
 
     async def list_events(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -778,6 +887,80 @@ class ReminderBot:
             prompt_text,
             message_thread_id=message.message_thread_id,
             reply_markup=keyboard,
+        )
+
+    async def handle_document_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        message = update.effective_message
+        chat = update.effective_chat
+        user = update.effective_user
+        if not message or not message.document or not chat or not user:
+            return
+        if not self._is_target_allowed(chat.id, message.message_thread_id):
+            logging.info(
+                "Ignored document from disallowed target chat=%s thread=%s",
+                chat.id,
+                message.message_thread_id,
+            )
+            return
+
+        payload = await self._load_backup_payload(message.document, context)
+        if not payload:
+            if (message.document.file_name or "").startswith("reminder_bot_backup_"):
+                await chat.send_message(
+                    "Не удалось распознать файл бекапа. Отправь исходные JSON-файлы без изменений.",
+                    message_thread_id=message.message_thread_id,
+                )
+            return
+
+        table_name = payload["table_name"]
+        backup_id = payload["backup_id"]
+        batch_key = self._make_restore_batch_key(
+            chat.id,
+            message.message_thread_id,
+            user.id,
+            backup_id,
+        )
+        batch = self.pending_restore_batches.setdefault(
+            batch_key,
+            BackupBatch(backup_id=backup_id, tables={}),
+        )
+        batch.tables[table_name] = payload
+
+        missing_tables = [table for table in BACKUP_TABLES if table not in batch.tables]
+        if missing_tables:
+            await chat.send_message(
+                (
+                    f"Получил таблицу {table_name} из бекапа {backup_id}.\n"
+                    f"Осталось прислать: {', '.join(missing_tables)}"
+                ),
+                message_thread_id=message.message_thread_id,
+            )
+            return
+
+        try:
+            imported_counts = self.storage.restore_from_backups(batch.tables)
+        except Exception:
+            logging.exception("Failed to restore backup %s", backup_id)
+            await chat.send_message(
+                "Не удалось восстановить бота из этих таблиц. Проверь файлы бекапа.",
+                message_thread_id=message.message_thread_id,
+            )
+            self.pending_restore_batches.pop(batch_key, None)
+            return
+
+        self.pending_restore_batches.pop(batch_key, None)
+        self._reload_scheduled_jobs()
+        imported_summary = ", ".join(
+            f"{table}={count}" for table, count in imported_counts.items()
+        )
+        await chat.send_message(
+            (
+                f"Бекап {backup_id} восстановлен.\n"
+                f"Импортировано строк: {imported_summary}"
+            ),
+            message_thread_id=message.message_thread_id,
         )
 
     def _parse_event_message(self, text: str) -> tuple[datetime, str, str] | None:
@@ -1289,6 +1472,55 @@ class ReminderBot:
             cutoff_utc.isoformat(),
         )
 
+    async def _load_backup_payload(self, document, context: ContextTypes.DEFAULT_TYPE) -> dict | None:
+        filename = document.file_name or ""
+        if not filename.endswith(".json"):
+            return None
+
+        try:
+            file = await context.bot.get_file(document.file_id)
+            raw_bytes = await file.download_as_bytearray()
+            payload = json.loads(raw_bytes.decode("utf-8"))
+        except Exception:
+            logging.exception("Failed to parse backup document %s", filename)
+            return None
+
+        required_keys = {"backup_version", "backup_id", "table_name", "columns", "rows"}
+        if not isinstance(payload, dict) or not required_keys.issubset(payload):
+            return None
+        if payload["table_name"] not in BACKUP_TABLES:
+            return None
+        return payload
+
+    @staticmethod
+    def _make_restore_batch_key(
+        chat_id: int,
+        message_thread_id: int | None,
+        user_id: int,
+        backup_id: str,
+    ) -> str:
+        return f"{chat_id}:{message_thread_id or 0}:{user_id}:{backup_id}"
+
+    def _reload_scheduled_jobs(self) -> None:
+        self.pending_events.clear()
+        for job in self.application.job_queue.jobs():
+            if job.name and (
+                job.name.startswith("event:")
+                or job.name.startswith("reminder_cleanup:")
+            ):
+                job.schedule_removal()
+
+        for event in self.storage.get_upcoming_events():
+            if self._is_target_allowed(event.chat_id, event.message_thread_id):
+                self.schedule_event_reminders(event)
+
+        for reminder_message in self.storage.get_pending_reminder_cleanups():
+            if self._is_target_allowed(
+                reminder_message.chat_id,
+                reminder_message.message_thread_id,
+            ):
+                self.schedule_reminder_message_cleanup(reminder_message)
+
     async def _reply(
         self,
         update: Update,
@@ -1428,10 +1660,12 @@ class ReminderBot:
             "В группах после выбора людей я отдельно спрошу периоды напоминаний.\n"
             "Если периоды не выбрать, будут включены все по умолчанию.\n\n"
             "Команды:\n"
+            "/backup - выгрузить все таблицы бота в чат\n"
             "/list - показать события и все будущие напоминания\n"
             "/delete ID - удалить событие\n"
             "/delete_all - удалить все события и напоминания в чате\n"
             "/help - показать подсказку\n\n"
+            "Для восстановления просто отправь обратно JSON-файлы бекапа в этот чат.\n\n"
             f"Часовой пояс бота: <b>{self.local_tz.key}</b>"
         )
 

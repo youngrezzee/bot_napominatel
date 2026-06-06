@@ -8,9 +8,29 @@ TOKEN="${1:-${TELEGRAM_BOT_TOKEN:-}}"
 TIMEZONE_VALUE="${BOT_TIMEZONE:-Europe/Moscow}"
 ALLOWED_CHAT_IDS_VALUE="${BOT_ALLOWED_CHAT_IDS:-}"
 ALLOWED_THREAD_IDS_VALUE="${BOT_ALLOWED_THREAD_IDS:-}"
+SKIP_OPTIONAL_PROMPTS="${SKIP_OPTIONAL_PROMPTS:-0}"
+
+prompt_tty() {
+  local __resultvar="$1"
+  local prompt="$2"
+  local default_value="${3:-}"
+  local value=""
+
+  if [[ -r /dev/tty ]]; then
+    read -r -p "${prompt}" value < /dev/tty
+  else
+    value=""
+  fi
+
+  if [[ -z "${value}" ]]; then
+    value="${default_value}"
+  fi
+
+  printf -v "${__resultvar}" '%s' "${value}"
+}
 
 if [[ -z "${TOKEN}" ]]; then
-  read -r -p "Enter Telegram bot token: " TOKEN
+  prompt_tty TOKEN "Enter Telegram bot token: "
 fi
 
 if [[ -z "${TOKEN}" ]]; then
@@ -47,12 +67,14 @@ echo "[3/6] Installing Python dependencies"
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 
-read -r -p "Timezone [${TIMEZONE_VALUE}]: " INPUT_TIMEZONE
-TIMEZONE_VALUE="${INPUT_TIMEZONE:-${TIMEZONE_VALUE}}"
-read -r -p "Allowed chat IDs, comma-separated [${ALLOWED_CHAT_IDS_VALUE}]: " INPUT_ALLOWED_CHAT_IDS
-ALLOWED_CHAT_IDS_VALUE="${INPUT_ALLOWED_CHAT_IDS:-${ALLOWED_CHAT_IDS_VALUE}}"
-read -r -p "Allowed topic/thread IDs, comma-separated [${ALLOWED_THREAD_IDS_VALUE}]: " INPUT_ALLOWED_THREAD_IDS
-ALLOWED_THREAD_IDS_VALUE="${INPUT_ALLOWED_THREAD_IDS:-${ALLOWED_THREAD_IDS_VALUE}}"
+if [[ "${SKIP_OPTIONAL_PROMPTS}" != "1" ]]; then
+  prompt_tty INPUT_TIMEZONE "Timezone [${TIMEZONE_VALUE}]: " "${TIMEZONE_VALUE}"
+  TIMEZONE_VALUE="${INPUT_TIMEZONE}"
+  prompt_tty INPUT_ALLOWED_CHAT_IDS "Allowed chat IDs, comma-separated [${ALLOWED_CHAT_IDS_VALUE}]: " "${ALLOWED_CHAT_IDS_VALUE}"
+  ALLOWED_CHAT_IDS_VALUE="${INPUT_ALLOWED_CHAT_IDS}"
+  prompt_tty INPUT_ALLOWED_THREAD_IDS "Allowed topic/thread IDs, comma-separated [${ALLOWED_THREAD_IDS_VALUE}]: " "${ALLOWED_THREAD_IDS_VALUE}"
+  ALLOWED_THREAD_IDS_VALUE="${INPUT_ALLOWED_THREAD_IDS}"
+fi
 
 echo "[4/6] Writing .env"
 cat > "${REPO_DIR}/.env" <<EOF

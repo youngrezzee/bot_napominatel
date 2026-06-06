@@ -242,7 +242,7 @@ curl -fsSL https://raw.githubusercontent.com/youngrezzee/bot_napominatel/main/de
 Дальше скрипт сам:
 
 - спросит токен бота
-- спросит часовой пояс
+- поставит часовой пояс `Europe/Moscow` по умолчанию
 - поставит системные пакеты
 - скачает репозиторий
 - создаст `.venv`
@@ -250,6 +250,12 @@ curl -fsSL https://raw.githubusercontent.com/youngrezzee/bot_napominatel/main/de
 - создаст `.env`
 - сгенерирует `systemd`-сервис
 - включит и запустит `reminder-bot`
+
+Если после установки нужен другой часовой пояс, измени `BOT_TIMEZONE` в `/opt/bot_napominatel/.env` и перезапусти сервис:
+
+```bash
+sudo systemctl restart reminder-bot
+```
 
 Если репозиторий уже скачан локально и нужен только локальный installer, можно запустить:
 
